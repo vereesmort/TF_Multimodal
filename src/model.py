@@ -68,7 +68,7 @@ def build_drug_init_tensor(
         ChemBERTaEncoder, TFIDFMonoEncoder, CURMonoEncoder, DrugFusionEncoder
     )
 
-    cache_path = Path(cache_dir) / "drug_init.pt" if cache_dir else None
+    cache_path = Path(cache_dir) / f"drug_init_dim{embedding_dim}_{mono_method}.pt" if cache_dir else None
     if cache_path and cache_path.exists():
         logger.info(f"Loading cached drug init from {cache_path}")
         return torch.load(cache_path)
@@ -148,7 +148,7 @@ def build_protein_init_tensor(
     )
     from src.encoders.protein_encoder import ESM2_DIMS
 
-    cache_path = Path(cache_dir) / "protein_init.pt" if cache_dir else None
+    cache_path = Path(cache_dir) / f"protein_init_dim{embedding_dim}_{esm2_model.split('/')[-1]}.pt" if cache_dir else None
     if cache_path and cache_path.exists():
         logger.info(f"Loading cached protein init from {cache_path}")
         return torch.load(cache_path)
