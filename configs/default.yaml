@@ -20,7 +20,7 @@ esm2_model: "facebook/esm2_t30_150M_UR50D"  # 150M; use t6_8M for CPU, t33_650M 
 n_hops: 1                      # PPI neighbourhood aggregation hops
 
 # ---- Training ----
-n_epochs: 200
+n_epochs: 50
 lr: 0.001
 batch_size: 512
 device: "cpu"                  # change to "cuda" if GPU available
