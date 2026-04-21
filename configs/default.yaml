@@ -1,0 +1,29 @@
+# TF-Decagon Improved — default training configuration
+# Override any value via CLI: python scripts/train.py --embedding_dim 128
+
+# ---- Data ----
+raw_dir: "data/raw"
+cache_dir: "data/cache"
+output_dir: "outputs/default"
+
+# ---- Model ----
+interaction: "SimplE"          # SimplE | ComplEx | DistMult
+embedding_dim: 256
+
+# ---- Drug encoder ----
+mono_method: "tfidf"           # tfidf | cur
+mono_components: 128           # dimensionality of mono-SE features
+chemberta_model: "seyonec/ChemBERTa-zinc-base-v2"
+
+# ---- Protein encoder ----
+esm2_model: "facebook/esm2_t6_8M_UR50D"  # small; change to t12/t30 for better quality
+n_hops: 1                      # PPI neighbourhood aggregation hops
+
+# ---- Training ----
+n_epochs: 200
+lr: 0.001
+batch_size: 512
+device: "cpu"                  # change to "cuda" if GPU available
+
+# ---- Evaluation ----
+n_negative_samples_eval: 100
