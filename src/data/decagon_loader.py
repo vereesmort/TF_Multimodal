@@ -188,6 +188,26 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
         logger.info(f"Monopharmacy matrix: {mat.shape}, "
                     f"density={mat.mean():.4f}")
 
+    # -- Drug SMILES (optional) --
+    # Expected file: data/raw/drug_smiles.json
+    # Format: { "CID003062316": "CCO", "CID000002244": "CC(=O)Oc1ccccc1C(=O)O", ... }
+    smiles_file = raw_path / "drug_smiles.json"
+    if smiles_file.exists():
+        with open(smiles_file, encoding="utf-8") as f:
+            data.drug_smiles = json.load(f)
+        n_with_smiles = sum(1 for d in data.drug_to_id if d in data.drug_smiles)
+        logger.info(
+            f"Loaded SMILES for {n_with_smiles}/{len(data.drug_to_id)} drugs "
+            f"from {smiles_file}"
+        )
+    else:
+        logger.warning(
+            f"No drug_smiles.json found in {raw_path}. "
+            "All drugs will use the ChemBERTa fallback SMILES ('C'). "
+            "To get real molecular embeddings, place a drug_smiles.json file "
+            "mapping STITCH CIDs (e.g. 'CID003062316') to SMILES strings."
+        )
+
     return data
 
 

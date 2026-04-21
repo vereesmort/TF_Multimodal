@@ -99,6 +99,12 @@ class ChemBERTaEncoder(nn.Module):
         Returns:
             Tensor of shape (n, 768) on CPU.
         """
+        if not smiles_list:
+            raise ValueError(
+                "smiles_list is empty. Make sure the Decagon data files are present "
+                "in raw_dir and were loaded correctly (run: bash data/raw/download_unpack.sh)."
+            )
+
         if self._model is None:
             self._load()
 
