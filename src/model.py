@@ -243,7 +243,6 @@ def build_pykeen_model(
         f"embedding_dim: {embedding_dim}"
     )
 
-    initializer = PretrainedInitializer(tensor=entity_init)
     common = dict(
         triples_factory=train_tf,
         embedding_dim=embedding_dim,
@@ -251,11 +250,18 @@ def build_pykeen_model(
     )
 
     if interaction == "ComplEx":
-        model = ComplEx(**common, entity_initializer=initializer)
+        # PyKEEN's ComplEx stores (real, imag) in a single tensor of shape
+        # (n_entities, embedding_dim, 2).  Initialise real part from our
+        # pretrained vectors; imaginary part starts at zero.
+        entity_init_cpx = torch.stack(
+            [entity_init, torch.zeros_like(entity_init)], dim=-1
+        )  # (n, d, 2)
+        model = ComplEx(**common, entity_initializer=PretrainedInitializer(tensor=entity_init_cpx))
     elif interaction == "SimplE":
-        model = SimplE(**common, entity_initializer=initializer)
+        # SimplE has two separate (n, d) embeddings — standard shape works.
+        model = SimplE(**common, entity_initializer=PretrainedInitializer(tensor=entity_init))
     elif interaction == "DistMult":
-        model = DistMult(**common, entity_initializer=initializer)
+        model = DistMult(**common, entity_initializer=PretrainedInitializer(tensor=entity_init))
     else:
         raise ValueError(
             f"Unknown interaction {interaction!r}. "
