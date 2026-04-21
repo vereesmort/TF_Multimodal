@@ -1,29 +1,28 @@
 #!/usr/bin/env python
 """
-End-to-end training script for TF-Decagon Improved.
+Training script for TF-Decagon Improved.
 
 Implements the exact Decagon / Lloyd et al. data split:
     - Polypharmacy edges split PER SIDE-EFFECT TYPE: 80/10/10
     - PPI and drug-target edges go entirely into training
     - Val/test edges are removed from the KGE training graph
 
-Runs both evaluation protocols after training:
-    Protocol 1 (--eval_protocol false_edge):
-        1 false edge per positive, directly comparable to published results.
-    Protocol 2 (--eval_protocol sampled_negatives):
-        N sampled negatives per positive, faster for ablations.
+After training the following artifacts are saved to --output_dir:
+    model.pt              final model weights
+    best_model.pt         weights at the epoch with lowest training loss
+    train_tf.pt           PyKEEN TriplesFactory used during training
+    entity_to_id.json     entity label → integer ID mapping
+    relation_to_id.json   relation label → integer ID mapping
+    test_edges.tsv        held-out test polypharmacy triples (TSV, no header)
+    config.yaml           fully resolved run configuration
+
+Next steps after training:
+    python scripts/generate_negatives.py --dataset_dir <output_dir>
+    python scripts/evaluate.py --checkpoint <output_dir>/best_model.pt \\
+        --dataset_dir <output_dir> --out_dir <output_dir>/results/
 
 Usage:
     python scripts/train.py --config configs/default.yaml
-
-    # Protocol 1 only (comparable to Lloyd et al. paper numbers)
-    python scripts/train.py --eval_protocol false_edge
-
-    # Fast ablation with sampled negatives
-    python scripts/train.py --eval_protocol sampled_negatives --n_negatives 100
-
-    # Run both protocols (default)
-    python scripts/train.py --eval_protocol both
 """
 
 import argparse
@@ -69,23 +68,12 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--device", type=str, default=None)
-    p.add_argument(
-        "--eval_protocol",
-        choices=["false_edge", "sampled_negatives", "both"],
-        default="both",
-        help=(
-            "false_edge: Decagon/Lloyd protocol (1 false per positive) — "
-            "use for comparisons with published results. "
-            "sampled_negatives: N negatives per positive — faster, for ablations. "
-            "both: run both (default)."
-        ),
-    )
-    p.add_argument(
-        "--n_negatives",
-        type=int,
-        default=100,
-        help="Negatives per positive for sampled_negatives protocol.",
-    )
+    p.add_argument("--ckpt_frequency", type=int, default=30,
+                   help="Save a PyKEEN checkpoint every N minutes (default: 30). "
+                        "Set to 0 to checkpoint after every epoch.")
+    p.add_argument("--patience", type=int, default=None,
+                   help="Early stopping patience in epochs on validation loss. "
+                        "Omit to disable early stopping.")
     p.add_argument("--skip_download", action="store_true")
     return p.parse_args()
 
@@ -124,9 +112,6 @@ def main():
         if val is not None:
             cfg[key] = val
 
-    eval_protocol = args.eval_protocol
-    n_negatives = args.n_negatives
-
     out_dir = Path(cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Config: {cfg}")
@@ -136,7 +121,7 @@ def main():
     # ------------------------------------------------------------------ #
     from src.data import (
         download_decagon, load_decagon,
-        split_polypharmacy_edges, build_true_edge_set, generate_false_edges,
+        split_polypharmacy_edges,
     )
 
     if not args.skip_download:
@@ -156,33 +141,10 @@ def main():
         random_state=42,
     )
 
-    # True-edge lookup over ALL known triples (used for filtering negatives)
-    true_edge_lookup = build_true_edge_set(data.poly_triples)
-    all_drug_labels = [f"drug:{d}" for d in data.drug_to_id]
-
     # ------------------------------------------------------------------ #
-    # 3. Pre-generate false test edges (Protocol 1)
+    # 3. Record labeled test edges (saved to disk after training)
     # ------------------------------------------------------------------ #
-    false_test_labeled = None
     test_labeled = [(f"drug:{h}", r, f"drug:{t}") for h, r, t in test_poly]
-    true_lookup_labeled = {
-        r: {(f"drug:{h}", f"drug:{t}") for h, t in pairs}
-        for r, pairs in true_edge_lookup.items()
-    }
-
-    if eval_protocol in ("false_edge", "both"):
-        logger.info("Generating false test edges (Protocol 1) ...")
-        false_test_labeled = generate_false_edges(
-            positive_edges=test_labeled,
-            all_drugs=all_drug_labels,
-            true_edge_lookup=true_lookup_labeled,
-            n_false_per_positive=1,
-            random_state=42,
-        )
-        logger.info(
-            f"False test edges: {len(false_test_labeled)} "
-            f"(must equal {len(test_labeled)})"
-        )
 
     # ------------------------------------------------------------------ #
     # 4. Build PyKEEN training triple factory
@@ -218,6 +180,15 @@ def main():
         f"(poly: {len(train_poly)}, structural: "
         f"{len(data.drug_target_edges) + len(data.ppi_edges)})"
     )
+
+    # Validation factory — polypharmacy edges only, same entity/relation mapping
+    val_triples_raw = [(f"drug:{h}", r, f"drug:{t}") for h, r, t in val_poly]
+    val_tf = TriplesFactory.from_labeled_triples(
+        triples=np.array(val_triples_raw),
+        entity_to_id=entity_to_id,
+        relation_to_id=relation_to_id,
+    )
+    logger.info(f"Validation graph: {len(val_triples_raw)} polypharmacy triples")
 
     # ------------------------------------------------------------------ #
     # 5. Entity initialization
@@ -264,104 +235,116 @@ def main():
     model = model.to(cfg["device"])
 
     from pykeen.training import SLCWATrainingLoop
+    from pykeen.stoppers import EarlyStopper
     from torch.optim import Adam
 
     optimizer = Adam(model.parameters(), lr=cfg["lr"])
+
+    # Best-model tracking: after each checkpoint interval we compute training
+    # loss and save the weights whenever it improves.
+    best_loss = float("inf")
+    best_model_path = out_dir / "best_model.pt"
+
+    stopper = None
+    if args.patience:
+        stopper = EarlyStopper(
+            model=model,
+            training_triples_factory=train_tf,
+            validation_triples_factory=val_tf,
+            frequency=1,               # evaluate every epoch
+            patience=args.patience,    # stop if no improvement for N evals
+            metric="hits@10",          # monitored metric
+            relative_delta=0.002,      # min improvement to count (0.2%)
+            result_tracker=None,
+        )
+        logger.info(
+            f"Early stopping enabled: patience={args.patience} epochs, "
+            f"metric=hits@10, min_delta=0.2%"
+        )
+
     training_loop = SLCWATrainingLoop(
-        model=model, triples_factory=train_tf, optimizer=optimizer,
-    )
-    logger.info(f"Training {cfg['interaction']} for {cfg['n_epochs']} epochs ...")
-    training_loop.train(
+        model=model,
         triples_factory=train_tf,
-        num_epochs=cfg["n_epochs"],
-        batch_size=cfg["batch_size"],
+        optimizer=optimizer,
     )
+
+    ckpt_dir = out_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_name = f"{cfg['interaction']}_{cfg['mono_method']}_dim{cfg['embedding_dim']}.pt"
+
+    # Train in blocks of `ckpt_frequency` epochs so we can track best model.
+    # Falls back to a single full run when ckpt_frequency is time-based (0).
+    n_epochs    = cfg["n_epochs"]
+    track_every = max(1, n_epochs // 20)   # track best every 5% of training
+
+    logger.info(
+        f"Training {cfg['interaction']} for {n_epochs} epochs | "
+        f"checkpoints every {args.ckpt_frequency} min → {ckpt_dir / ckpt_name} | "
+        f"best model → {best_model_path}"
+    )
+
+    epochs_done = 0
+    while epochs_done < n_epochs:
+        step = min(track_every, n_epochs - epochs_done)
+        losses = training_loop.train(
+            triples_factory=train_tf,
+            num_epochs=step,
+            batch_size=cfg["batch_size"],
+            checkpoint_name=ckpt_name,
+            checkpoint_directory=ckpt_dir,
+            checkpoint_frequency=args.ckpt_frequency,
+            stopper=stopper,
+        )
+        epochs_done += step
+
+        # losses is a list of per-epoch losses from this block
+        mean_loss = sum(losses) / len(losses) if losses else float("inf")
+        if mean_loss < best_loss:
+            best_loss = mean_loss
+            torch.save(model.state_dict(), best_model_path)
+            logger.info(
+                f"  epoch {epochs_done}/{n_epochs} — "
+                f"new best loss {best_loss:.4f} → saved {best_model_path}"
+            )
+
+        # EarlyStopper signals stop by setting should_stop
+        if stopper is not None and stopper.should_stop:
+            logger.info(f"Early stopping triggered at epoch {epochs_done}.")
+            break
 
     torch.save(model.state_dict(), out_dir / "model.pt")
-    logger.info(f"Model saved to {out_dir / 'model.pt'}")
+    logger.info(f"Final model saved → {out_dir / 'model.pt'}")
+    logger.info(f"Best model (loss={best_loss:.4f}) saved → {best_model_path}")
 
     # ------------------------------------------------------------------ #
-    # 7. Evaluation
+    # 7. Save artifacts for standalone evaluation scripts
     # ------------------------------------------------------------------ #
-    from src.evaluation.protocols import (
-        evaluate_false_edge_protocol,
-        evaluate_sampled_negatives_protocol,
-        evaluate_stratified,
-        summarise,
-        summarise_stratified,
+    import json
+    import pandas as pd
+    import yaml
+
+    (out_dir / "entity_to_id.json").write_text(
+        json.dumps(entity_to_id, indent=2)
     )
+    (out_dir / "relation_to_id.json").write_text(
+        json.dumps(relation_to_id, indent=2)
+    )
+    torch.save(train_tf, out_dir / "train_tf.pt")
 
-    model_tag = f"{cfg['interaction']}-{cfg['mono_method'].upper()}"
+    pd.DataFrame(test_labeled).to_csv(
+        out_dir / "test_edges.tsv", header=False, index=False, sep="\t"
+    )
+    (out_dir / "config.yaml").write_text(yaml.dump(cfg))
 
-    # Protocol 1: False-edge (Decagon / Lloyd et al.)
-    if eval_protocol in ("false_edge", "both"):
-        logger.info("Evaluating — Protocol 1: false-edge (Decagon protocol) ...")
-        df_fe = evaluate_false_edge_protocol(
-            model=model,
-            test_triples=test_labeled,
-            false_triples=false_test_labeled,
-            entity_to_id=entity_to_id,
-            relation_to_id=relation_to_id,
-            device=cfg["device"],
-        )
-        summarise(df_fe, model_name=model_tag, protocol="false_edge")
-        df_fe.to_csv(out_dir / "eval_false_edge.csv", index=False)
-
-        df_strat_fe = evaluate_stratified(
-            results_df=df_fe,
-            test_triples=test_labeled,
-            false_triples=false_test_labeled,
-            drug_targets=data.drug_targets,
-            protein_to_id=data.protein_to_id,
-            model=model,
-            entity_to_id=entity_to_id,
-            relation_to_id=relation_to_id,
-            protocol="false_edge",
-            all_drug_labels=all_drug_labels,
-            true_edge_lookup=true_lookup_labeled,
-            device=cfg["device"],
-        )
-        summarise_stratified(df_strat_fe, model_name=model_tag, protocol="false_edge")
-        df_strat_fe.to_csv(out_dir / "eval_false_edge_stratified.csv", index=False)
-
-    # Protocol 2: Sampled negatives
-    if eval_protocol in ("sampled_negatives", "both"):
-        logger.info(f"Evaluating — Protocol 2: sampled negatives (N={n_negatives}) ...")
-        df_sn = evaluate_sampled_negatives_protocol(
-            model=model,
-            test_triples=test_labeled,
-            all_drug_labels=all_drug_labels,
-            true_edge_lookup=true_lookup_labeled,
-            entity_to_id=entity_to_id,
-            relation_to_id=relation_to_id,
-            n_negatives=n_negatives,
-            device=cfg["device"],
-        )
-        summarise(df_sn, model_name=model_tag, protocol=f"sampled_neg_{n_negatives}")
-        df_sn.to_csv(out_dir / "eval_sampled_negatives.csv", index=False)
-
-        df_strat_sn = evaluate_stratified(
-            results_df=df_sn,
-            test_triples=test_labeled,
-            false_triples=None,
-            drug_targets=data.drug_targets,
-            protein_to_id=data.protein_to_id,
-            model=model,
-            entity_to_id=entity_to_id,
-            relation_to_id=relation_to_id,
-            protocol="sampled_negatives",
-            all_drug_labels=all_drug_labels,
-            true_edge_lookup=true_lookup_labeled,
-            n_negatives=n_negatives,
-            device=cfg["device"],
-        )
-        summarise_stratified(
-            df_strat_sn, model_name=model_tag,
-            protocol=f"sampled_neg_{n_negatives}"
-        )
-        df_strat_sn.to_csv(out_dir / "eval_sampled_negatives_stratified.csv", index=False)
-
-    logger.info(f"Done. All outputs in: {out_dir}")
+    logger.info(
+        f"Artifacts saved to {out_dir}/\n"
+        f"  Next steps:\n"
+        f"    python scripts/generate_negatives.py --dataset_dir {out_dir}\n"
+        f"    python scripts/evaluate.py "
+        f"--checkpoint {best_model_path} "
+        f"--dataset_dir {out_dir} "
+        f"--out_dir {out_dir / 'results'}"
+    )
 
 
 if __name__ == "__main__":
