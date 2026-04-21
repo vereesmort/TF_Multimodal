@@ -18,6 +18,7 @@ import logging
 import os
 import urllib.request
 import gzip
+import tarfile
 import csv
 import json
 from pathlib import Path
@@ -31,12 +32,13 @@ logger = logging.getLogger(__name__)
 
 SNAP_BASE = "http://snap.stanford.edu/decagon/"
 
+# Each entry: csv_filename -> tar.gz archive name on SNAP
 SNAP_FILES = {
-    "ppi": "bio-decagon-ppi.csv",
-    "targets": "bio-decagon-targets.csv",
-    "combo": "bio-decagon-combo.csv",
-    "mono": "bio-decagon-mono.csv",
-    "se_names": "bio-decagon-effectcategories.csv",
+    "ppi":      ("bio-decagon-ppi.csv",              "bio-decagon-ppi.tar.gz"),
+    "targets":  ("bio-decagon-targets.csv",          "bio-decagon-targets.tar.gz"),
+    "combo":    ("bio-decagon-combo.csv",            "bio-decagon-combo.tar.gz"),
+    "mono":     ("bio-decagon-mono.csv",             "bio-decagon-mono.tar.gz"),
+    "se_names": ("bio-decagon-effectcategories.csv", "bio-decagon-effectcategories.tar.gz"),
 }
 
 
@@ -67,22 +69,40 @@ class DecagonData:
 
 
 def download_decagon(raw_dir: str = "data/raw") -> Path:
-    """Download all Decagon files to raw_dir if not already present."""
+    """Download all Decagon files to raw_dir if not already present.
+
+    Files are distributed as .tar.gz archives on SNAP; this function
+    downloads each archive, extracts the CSV, and removes the archive.
+    """
     raw_path = Path(raw_dir)
     raw_path.mkdir(parents=True, exist_ok=True)
 
-    for key, fname in SNAP_FILES.items():
-        dest = raw_path / fname
-        if not dest.exists():
-            url = SNAP_BASE + fname
-            logger.info(f"Downloading {url} ...")
-            try:
-                urllib.request.urlretrieve(url, dest)
-                logger.info(f"  Saved to {dest}")
-            except Exception as e:
-                logger.warning(f"  Failed to download {fname}: {e}")
-        else:
-            logger.info(f"  {fname} already present, skipping.")
+    for key, (csv_fname, tar_fname) in SNAP_FILES.items():
+        dest_csv = raw_path / csv_fname
+        if dest_csv.exists():
+            logger.info(f"  {csv_fname} already present, skipping.")
+            continue
+
+        url = SNAP_BASE + tar_fname
+        dest_tar = raw_path / tar_fname
+        logger.info(f"Downloading {url} ...")
+        try:
+            urllib.request.urlretrieve(url, dest_tar)
+            logger.info(f"  Extracting {tar_fname} ...")
+            with tarfile.open(dest_tar, "r:gz") as tf:
+                # Extract only the CSV member (ignore any directory prefix)
+                for member in tf.getmembers():
+                    if member.name.endswith(".csv"):
+                        member.name = csv_fname  # flatten to raw_dir
+                        tf.extract(member, path=raw_path)
+                        break
+            dest_tar.unlink()
+            logger.info(f"  Saved to {dest_csv}")
+        except Exception as e:
+            logger.warning(f"  Failed to download/extract {tar_fname}: {e}")
+            if dest_tar.exists():
+                dest_tar.unlink()
+
     return raw_path
 
 
@@ -92,7 +112,7 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
     data = DecagonData()
 
     # -- PPI edges --
-    ppi_file = raw_path / SNAP_FILES["ppi"]
+    ppi_file = raw_path / SNAP_FILES["ppi"][0]
     if ppi_file.exists():
         df = pd.read_csv(ppi_file)
         # columns: Gene 1, Gene 2
@@ -105,7 +125,7 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
         logger.info(f"Loaded {len(data.ppi_edges)} PPI edges, {len(data.protein_to_id)} proteins")
 
     # -- Drug-target edges --
-    target_file = raw_path / SNAP_FILES["targets"]
+    target_file = raw_path / SNAP_FILES["targets"][0]
     if target_file.exists():
         df = pd.read_csv(target_file)
         cols = df.columns.tolist()
@@ -118,7 +138,7 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
         logger.info(f"Loaded {len(data.drug_target_edges)} drug-target edges")
 
     # -- Polypharmacy combo edges --
-    combo_file = raw_path / SNAP_FILES["combo"]
+    combo_file = raw_path / SNAP_FILES["combo"][0]
     if combo_file.exists():
         df = pd.read_csv(combo_file)
         # columns: STITCH 1, STITCH 2, Polypharmacy Side Effect, Side Effect Name
@@ -133,7 +153,7 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
                     f"{len(data.se_pair_to_id)} side effect types")
 
     # -- Monopharmacy side effects --
-    mono_file = raw_path / SNAP_FILES["mono"]
+    mono_file = raw_path / SNAP_FILES["mono"][0]
     if mono_file.exists():
         df = pd.read_csv(mono_file)
         # columns: STITCH, Side Effect Name, Umls concept id

@@ -5,7 +5,7 @@ Provides two complementary drug representations:
 
 1. ChemBERTa encoder
    - Encodes drug SMILES strings using a RoBERTa model pre-trained on SMILES
-     (seyonec/ChemBERTa-zinc-base-v2 from HuggingFace).
+     (seyonec/ChemBERTa-zinc-base-v1 from HuggingFace).
    - Produces a 768-d embedding per drug capturing molecular structure.
 
 2. Monopharmacy side effect encoder
@@ -42,7 +42,7 @@ class ChemBERTaEncoder(nn.Module):
     """
     Encode drug SMILES using ChemBERTa (RoBERTa trained on SMILES).
 
-    Model: seyonec/ChemBERTa-zinc-base-v2  (HuggingFace)
+    Model: seyonec/ChemBERTa-zinc-base-v1  (HuggingFace)
     Output: mean-pooled last hidden state, shape (n_drugs, 768)
 
     Args:
@@ -54,7 +54,7 @@ class ChemBERTaEncoder(nn.Module):
         device: torch device string.
     """
 
-    DEFAULT_MODEL = "seyonec/ChemBERTa-zinc-base-v2"
+    DEFAULT_MODEL = "seyonec/ChemBERTa-zinc-base-v1"
 
     def __init__(
         self,
