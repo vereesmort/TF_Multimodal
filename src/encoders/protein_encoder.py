@@ -62,7 +62,7 @@ class ESM2Encoder(nn.Module):
     def __init__(
         self,
         model_name: str = ESM2_MODELS["small"],
-        batch_size: int = 32,
+        batch_size: int = 64,
         freeze: bool = True,
         max_length: int = 512,
         device: str = "cpu",
@@ -98,34 +98,67 @@ class ESM2Encoder(nn.Module):
         """
         Encode amino acid sequences.
 
+        Sequences are sorted by length before batching to minimise padding
+        per batch, then results are reordered back to the original order.
+
         Args:
             sequences: list of amino acid strings (single-letter code).
 
         Returns:
             (n, esm_dim) tensor on CPU.
         """
+        if not sequences:
+            raise ValueError("sequences list is empty.")
+
         if self._model is None:
             self._load()
 
-        all_embeddings = []
-        for i in range(0, len(sequences), self.batch_size):
-            batch = sequences[i : i + self.batch_size]
+        n_total = len(sequences)
+        n_batches = (n_total + self.batch_size - 1) // self.batch_size
+        log_every = max(1, n_batches // 10)  # log ~10 progress updates
+
+        # Sort by length to minimise padding — remember original order
+        order = sorted(range(n_total), key=lambda i: len(sequences[i]))
+        sorted_seqs = [sequences[i] for i in order]
+        # Map sorted position -> original position for restoration
+        restore = [0] * n_total
+        for sorted_pos, orig_pos in enumerate(order):
+            restore[sorted_pos] = orig_pos
+
+        sorted_embeddings = [None] * n_total
+
+        for batch_idx, i in enumerate(range(0, n_total, self.batch_size)):
+            batch = sorted_seqs[i : i + self.batch_size]
+
+            # Use actual max length in this batch — avoids padding to 512
+            # when most sequences in the batch are much shorter
+            batch_max_len = min(max(len(s) + 2 for s in batch), self.max_length)
+
             encoded = self._tokenizer(
                 batch,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=self.max_length,
+                max_length=batch_max_len,
             )
             encoded = {k: v.to(self.device) for k, v in encoded.items()}
             with torch.set_grad_enabled(not self.freeze):
                 outputs = self._model(**encoded)
-            # Mean pool (masked)
             mask = encoded["attention_mask"].unsqueeze(-1).float()
             emb = (outputs.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-            all_embeddings.append(emb.cpu())
+            emb = emb.cpu()
 
-        return torch.cat(all_embeddings, dim=0)
+            for j, orig_pos in enumerate(restore[i : i + len(batch)]):
+                sorted_embeddings[orig_pos] = emb[j]
+
+            if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == n_batches:
+                done = min(i + self.batch_size, n_total)
+                logger.info(
+                    f"ESM-2 encoding: {done}/{n_total} sequences "
+                    f"({done / n_total * 100:.0f}%)"
+                )
+
+        return torch.stack(sorted_embeddings, dim=0)
 
     def encode_proteins(
         self,
