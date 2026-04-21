@@ -16,7 +16,7 @@ mono_components: 128           # dimensionality of mono-SE features
 chemberta_model: "seyonec/ChemBERTa-zinc-base-v1"
 
 # ---- Protein encoder ----
-esm2_model: "facebook/esm2_t6_8M_UR50D"  # small; change to t12/t30 for better quality
+esm2_model: "facebook/esm2_t30_150M_UR50D"  # 150M; use t6_8M for CPU, t33_650M for max quality
 n_hops: 1                      # PPI neighbourhood aggregation hops
 
 # ---- Training ----
