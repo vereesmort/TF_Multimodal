@@ -38,7 +38,7 @@ def build_drug_init_tensor(
     embedding_dim: int = 256,
     mono_method: Literal["tfidf", "cur"] = "tfidf",
     mono_components: int = 128,
-    chemberta_model: str = "seyonec/ChemBERTa-zinc-base-v2",
+    chemberta_model: str = "seyonec/ChemBERTa-zinc-base-v1",
     device: str = "cpu",
     cache_dir: Optional[str] = None,
 ) -> torch.Tensor:
