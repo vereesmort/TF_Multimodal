@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--embedding_dim", type=int, default=256)
     parser.add_argument("--mono_method", choices=["tfidf", "cur"], default="tfidf")
     parser.add_argument("--mono_components", type=int, default=128)
+    parser.add_argument("--chemberta_model", type=str, default="seyonec/ChemBERTa-zinc-base-v1")
     parser.add_argument("--esm2_model", type=str, default="facebook/esm2_t6_8M_UR50D")
     parser.add_argument("--n_hops", type=int, default=1)
     parser.add_argument("--device", type=str, default="cpu")
@@ -58,6 +59,7 @@ def main():
         embedding_dim=args.embedding_dim,
         mono_method=args.mono_method,
         mono_components=args.mono_components,
+        chemberta_model=args.chemberta_model,
         device=args.device,
         cache_dir=args.cache_dir,
     )

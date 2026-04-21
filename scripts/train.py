@@ -53,6 +53,16 @@ def parse_args():
     p.add_argument("--cache_dir", type=str, default="data/cache")
     p.add_argument("--output_dir", type=str, default="outputs")
     p.add_argument("--mono_method", choices=["tfidf", "cur"], default=None)
+    p.add_argument("--mono_components", type=int, default=None,
+                   help="Dimensionality of monopharmacy SE features (default: 128)")
+    p.add_argument("--chemberta_model", type=str, default=None,
+                   help="HuggingFace ChemBERTa model ID for drug SMILES encoding "
+                        "(default: seyonec/ChemBERTa-zinc-base-v1)")
+    p.add_argument("--esm2_model", type=str, default=None,
+                   help="HuggingFace ESM-2 model ID for protein sequence encoding "
+                        "(default: facebook/esm2_t6_8M_UR50D). "
+                        "Options: esm2_t6_8M_UR50D | esm2_t12_35M_UR50D | "
+                        "esm2_t30_150M_UR50D | esm2_t33_650M_UR50D")
     p.add_argument("--interaction", choices=["SimplE", "ComplEx", "DistMult"], default=None)
     p.add_argument("--embedding_dim", type=int, default=None)
     p.add_argument("--n_epochs", type=int, default=None)
@@ -102,13 +112,14 @@ def main():
     cfg.setdefault("batch_size", 512)
     cfg.setdefault("device", "cuda" if torch.cuda.is_available() else "cpu")
     cfg.setdefault("mono_components", 128)
+    cfg.setdefault("chemberta_model", "seyonec/ChemBERTa-zinc-base-v1")
     cfg.setdefault("esm2_model", "facebook/esm2_t6_8M_UR50D")
     cfg.setdefault("n_hops", 1)
     cfg.setdefault("val_frac", 0.10)
     cfg.setdefault("test_frac", 0.10)
 
-    for key in ["mono_method", "interaction", "embedding_dim",
-                "n_epochs", "lr", "batch_size", "device"]:
+    for key in ["mono_method", "mono_components", "chemberta_model", "esm2_model",
+                "interaction", "embedding_dim", "n_epochs", "lr", "batch_size", "device"]:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val

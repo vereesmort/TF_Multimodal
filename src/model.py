@@ -190,16 +190,26 @@ def build_pykeen_model(
     protein_to_id: Dict[str, int],
     interaction: Literal["SimplE", "ComplEx", "DistMult"] = "SimplE",
     embedding_dim: int = 256,
+    random_seed: int = 42,
 ):
     """
-    Build a PyKEEN ERModel with pretrained entity initializations.
+    Build a PyKEEN model with pretrained entity initializations.
+
+    Uses PyKEEN's dedicated model classes (ComplEx, SimplE, DistMult) rather
+    than ERModel directly, so relation representations are configured
+    automatically for each interaction type.
+
+    The pretrained initializer is applied to the primary entity embedding
+    (real part for ComplEx/SimplE, single embedding for DistMult).  Additional
+    embeddings required by each interaction (imaginary parts, inverse relations)
+    use PyKEEN's default xavier_uniform_ initializer.
 
     The merged entity embedding matrix has:
-        rows [0 .. n_drugs-1]          <- drug_init rows (in drug_to_id order)
-        rows [n_drugs .. n_drugs+n_prot-1] <- protein_init rows
+        rows [0 .. n_drugs-1]               <- drug_init rows
+        rows [n_drugs .. n_drugs+n_prot-1]  <- protein_init rows
 
     This ordering must match the entity_to_id mapping produced by
-    data/decagon_loader.py:build_pykeen_triples().
+    decagon_loader.py:build_pykeen_triples().
 
     Args:
         train_tf: PyKEEN TriplesFactory.
@@ -210,20 +220,19 @@ def build_pykeen_model(
         protein_to_id: protein identifier -> integer index.
         interaction: KGE interaction function name.
         embedding_dim: must match drug_init / protein_init dim.
+        random_seed: for reproducibility.
 
     Returns:
         PyKEEN model ready for training.
     """
-    from pykeen.models import ERModel
-    from pykeen.nn import Embedding
+    from pykeen.models import ComplEx, DistMult, SimplE
     from pykeen.nn.init import PretrainedInitializer
 
     n_entities = len(entity_to_id)
     n_drugs = len(drug_to_id)
     n_proteins = len(protein_to_id)
 
-    # Build merged init tensor in entity_to_id order
-    # drug entities have ids 0..n_drugs-1, proteins n_drugs..n_drugs+n_proteins-1
+    # Build merged init tensor: drugs first, then proteins
     entity_init = torch.zeros(n_entities, embedding_dim)
     entity_init[:n_drugs] = drug_init
     entity_init[n_drugs : n_drugs + n_proteins] = protein_init
@@ -234,14 +243,42 @@ def build_pykeen_model(
         f"embedding_dim: {embedding_dim}"
     )
 
-    model = ERModel(
+    initializer = PretrainedInitializer(tensor=entity_init)
+    common = dict(
         triples_factory=train_tf,
-        interaction=interaction,
-        entity_representations=Embedding(
-            max_id=n_entities,
-            embedding_dim=embedding_dim,
-            initializer=PretrainedInitializer(tensor=entity_init),
-        ),
-        entity_representations_kwargs=None,
+        embedding_dim=embedding_dim,
+        random_seed=random_seed,
     )
+
+    if interaction == "ComplEx":
+        # ComplEx uses two entity embeddings (real + imaginary).
+        # Initialise the real part with our pretrained vectors; imaginary
+        # part uses PyKEEN default (xavier_uniform_).
+        model = ComplEx(
+            **common,
+            entity_representations_kwargs=[
+                {"initializer": initializer},  # real
+                {},                            # imaginary — default init
+            ],
+        )
+    elif interaction == "SimplE":
+        # SimplE uses two entity embeddings (head + tail factorisation).
+        model = SimplE(
+            **common,
+            entity_representations_kwargs=[
+                {"initializer": initializer},  # h embedding
+                {},                            # t embedding — default init
+            ],
+        )
+    elif interaction == "DistMult":
+        model = DistMult(
+            **common,
+            entity_initializer=initializer,
+        )
+    else:
+        raise ValueError(
+            f"Unknown interaction {interaction!r}. "
+            "Choose from: 'SimplE', 'ComplEx', 'DistMult'."
+        )
+
     return model
