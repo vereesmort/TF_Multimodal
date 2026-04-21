@@ -64,13 +64,28 @@ def main():
     logger.info(f"Drug init tensor: {drug_init.shape}")
 
     # Protein embeddings
+    # Load protein sequences if available
+    import json
+    protein_seq_file = Path(args.raw_dir) / "protein_sequences.json"
+    if protein_seq_file.exists():
+        with open(protein_seq_file, encoding="utf-8") as f:
+            protein_sequences = json.load(f)
+        logger.info(f"Loaded sequences for {len(protein_sequences)} proteins from {protein_seq_file}")
+    else:
+        protein_sequences = {}
+        logger.warning(
+            f"No protein_sequences.json found in {args.raw_dir}. "
+            "All proteins will use the ESM-2 fallback sequence. "
+            "Fetch sequences from UniProt using gene IDs in bio-decagon-targets.csv."
+        )
+
     logger.info("Precomputing protein embeddings ...")
     protein_init = build_protein_init_tensor(
         protein_to_id=data.protein_to_id,
         ppi_edges=data.ppi_edges,
         drug_targets=data.drug_targets,
         drug_to_id=data.drug_to_id,
-        protein_sequences={},  # Provide your own FASTA-derived sequences
+        protein_sequences=protein_sequences,
         embedding_dim=args.embedding_dim,
         esm2_model=args.esm2_model,
         n_hops=args.n_hops,
