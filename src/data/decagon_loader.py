@@ -111,13 +111,14 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
     raw_path = Path(raw_dir)
     data = DecagonData()
 
-    # Decagon CSVs use Latin-1 encoding (side effect names contain special chars)
-    ENC = "latin-1"
+    # Decagon files are tab-separated despite the .csv extension, and use
+    # Latin-1 encoding (side effect names contain special characters like °).
+    READ_OPTS = dict(sep="\t", encoding="latin-1")
 
     # -- PPI edges --
     ppi_file = raw_path / SNAP_FILES["ppi"][0]
     if ppi_file.exists():
-        df = pd.read_csv(ppi_file, encoding=ENC)
+        df = pd.read_csv(ppi_file, **READ_OPTS)
         # columns: Gene 1, Gene 2
         cols = df.columns.tolist()
         for _, row in df.iterrows():
@@ -130,7 +131,7 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
     # -- Drug-target edges --
     target_file = raw_path / SNAP_FILES["targets"][0]
     if target_file.exists():
-        df = pd.read_csv(target_file, encoding=ENC)
+        df = pd.read_csv(target_file, **READ_OPTS)
         cols = df.columns.tolist()
         for _, row in df.iterrows():
             drug, protein = str(row[cols[0]]), str(row[cols[1]])
@@ -143,7 +144,7 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
     # -- Polypharmacy combo edges --
     combo_file = raw_path / SNAP_FILES["combo"][0]
     if combo_file.exists():
-        df = pd.read_csv(combo_file, encoding=ENC)
+        df = pd.read_csv(combo_file, **READ_OPTS)
         # columns: STITCH 1, STITCH 2, Polypharmacy Side Effect, Side Effect Name
         for _, row in df.iterrows():
             d1, d2 = str(row.iloc[0]), str(row.iloc[1])
@@ -158,7 +159,7 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
     # -- Monopharmacy side effects --
     mono_file = raw_path / SNAP_FILES["mono"][0]
     if mono_file.exists():
-        df = pd.read_csv(mono_file, encoding=ENC)
+        df = pd.read_csv(mono_file, **READ_OPTS)
         # columns: STITCH, Side Effect Name, Umls concept id
         drug_col = df.columns[0]
         se_col = df.columns[1]
