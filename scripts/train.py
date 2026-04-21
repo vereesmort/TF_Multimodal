@@ -144,7 +144,7 @@ def main():
     # ------------------------------------------------------------------ #
     # 3. Record labeled test edges (saved to disk after training)
     # ------------------------------------------------------------------ #
-    test_labeled = [(f"drug:{h}", r, f"drug:{t}") for h, r, t in test_poly]
+    test_labeled = [(f"drug:{h}", f"SE:{r}", f"drug:{t}") for h, r, t in test_poly]
 
     # ------------------------------------------------------------------ #
     # 4. Build PyKEEN training triple factory
@@ -165,7 +165,7 @@ def main():
     relation_to_id["ppi"] = len(relation_to_id)
 
     train_triples_raw = (
-        [(f"drug:{h}", r, f"drug:{t}") for h, r, t in train_poly]
+        [(f"drug:{h}", f"SE:{r}", f"drug:{t}") for h, r, t in train_poly]
         + [(f"drug:{d}", "drug_targets", f"protein:{p}") for d, p in data.drug_target_edges]
         + [(f"protein:{p1}", "ppi", f"protein:{p2}") for p1, p2 in data.ppi_edges]
     )
@@ -182,7 +182,7 @@ def main():
     )
 
     # Validation factory — polypharmacy edges only, same entity/relation mapping
-    val_triples_raw = [(f"drug:{h}", r, f"drug:{t}") for h, r, t in val_poly]
+    val_triples_raw = [(f"drug:{h}", f"SE:{r}", f"drug:{t}") for h, r, t in val_poly]
     val_tf = TriplesFactory.from_labeled_triples(
         triples=np.array(val_triples_raw),
         entity_to_id=entity_to_id,
