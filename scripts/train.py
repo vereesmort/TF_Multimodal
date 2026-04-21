@@ -240,9 +240,6 @@ def main():
 
     optimizer = Adam(model.parameters(), lr=cfg["lr"])
 
-    # Best-model tracking: after each checkpoint interval we compute training
-    # loss and save the weights whenever it improves.
-    best_loss = float("inf")
     best_model_path = out_dir / "best_model.pt"
 
     stopper = None
@@ -271,50 +268,39 @@ def main():
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_name = f"{cfg['interaction']}_{cfg['mono_method']}_dim{cfg['embedding_dim']}.pt"
+    n_epochs  = cfg["n_epochs"]
 
-    # Train in blocks of `ckpt_frequency` epochs so we can track best model.
-    # Falls back to a single full run when ckpt_frequency is time-based (0).
-    n_epochs    = cfg["n_epochs"]
-    track_every = max(1, n_epochs // 20)   # track best every 5% of training
-
+    # PyKEEN checkpoints store absolute epoch counts, so num_epochs must be
+    # the TOTAL target epochs for the full run — not a per-block step size.
+    # A chunked while-loop is incompatible with PyKEEN checkpointing because
+    # each call would resume from the checkpoint and immediately exit
+    # (already at the requested epoch count).
     logger.info(
         f"Training {cfg['interaction']} for {n_epochs} epochs | "
         f"checkpoints every {args.ckpt_frequency} min → {ckpt_dir / ckpt_name} | "
         f"best model → {best_model_path}"
     )
 
-    epochs_done = 0
-    while epochs_done < n_epochs:
-        step = min(track_every, n_epochs - epochs_done)
-        losses = training_loop.train(
-            triples_factory=train_tf,
-            num_epochs=step,
-            batch_size=cfg["batch_size"],
-            checkpoint_name=ckpt_name,
-            checkpoint_directory=ckpt_dir,
-            checkpoint_frequency=args.ckpt_frequency,
-            stopper=stopper,
-        )
-        epochs_done += step
+    losses = training_loop.train(
+        triples_factory=train_tf,
+        num_epochs=n_epochs,
+        batch_size=cfg["batch_size"],
+        checkpoint_name=ckpt_name,
+        checkpoint_directory=ckpt_dir,
+        checkpoint_frequency=args.ckpt_frequency,
+        stopper=stopper,
+    )
 
-        # losses is a list of per-epoch losses from this block
-        mean_loss = sum(losses) / len(losses) if losses else float("inf")
-        if mean_loss < best_loss:
-            best_loss = mean_loss
-            torch.save(model.state_dict(), best_model_path)
-            logger.info(
-                f"  epoch {epochs_done}/{n_epochs} — "
-                f"new best loss {best_loss:.4f} → saved {best_model_path}"
-            )
-
-        # EarlyStopper signals stop by setting should_stop
-        if stopper is not None and stopper.should_stop:
-            logger.info(f"Early stopping triggered at epoch {epochs_done}.")
-            break
-
+    # Save the final model weights.
+    # If EarlyStopper triggered, PyKEEN restores the best weights before
+    # returning, so model.state_dict() is already the best checkpoint.
     torch.save(model.state_dict(), out_dir / "model.pt")
-    logger.info(f"Final model saved → {out_dir / 'model.pt'}")
-    logger.info(f"Best model (loss={best_loss:.4f}) saved → {best_model_path}")
+    torch.save(model.state_dict(), best_model_path)
+    mean_loss = sum(losses) / len(losses) if losses else float("nan")
+    logger.info(
+        f"Training complete — mean loss over last epoch block: {mean_loss:.4f}"
+    )
+    logger.info(f"Model saved → {out_dir / 'model.pt'}  |  {best_model_path}")
 
     # ------------------------------------------------------------------ #
     # 7. Save artifacts for standalone evaluation scripts
