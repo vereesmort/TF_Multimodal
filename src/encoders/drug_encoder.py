@@ -59,7 +59,7 @@ class ChemBERTaEncoder(nn.Module):
     def __init__(
         self,
         model_name: str = DEFAULT_MODEL,
-        batch_size: int = 64,
+        batch_size: int = 256,
         freeze: bool = True,
         device: str = "cpu",
     ):

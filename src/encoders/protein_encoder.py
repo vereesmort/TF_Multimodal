@@ -62,7 +62,7 @@ class ESM2Encoder(nn.Module):
     def __init__(
         self,
         model_name: str = ESM2_MODELS["small"],
-        batch_size: int = 64,
+        batch_size: int = 256,
         freeze: bool = True,
         max_length: int = 512,
         device: str = "cpu",
