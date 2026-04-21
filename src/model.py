@@ -251,30 +251,11 @@ def build_pykeen_model(
     )
 
     if interaction == "ComplEx":
-        # ComplEx uses two entity embeddings (real + imaginary).
-        # Initialise the real part with our pretrained vectors; imaginary
-        # part uses PyKEEN default (xavier_uniform_).
-        model = ComplEx(
-            **common,
-            entity_representations_kwargs=[
-                {"initializer": initializer},  # real
-                {},                            # imaginary — default init
-            ],
-        )
+        model = ComplEx(**common, entity_initializer=initializer)
     elif interaction == "SimplE":
-        # SimplE uses two entity embeddings (head + tail factorisation).
-        model = SimplE(
-            **common,
-            entity_representations_kwargs=[
-                {"initializer": initializer},  # h embedding
-                {},                            # t embedding — default init
-            ],
-        )
+        model = SimplE(**common, entity_initializer=initializer)
     elif interaction == "DistMult":
-        model = DistMult(
-            **common,
-            entity_initializer=initializer,
-        )
+        model = DistMult(**common, entity_initializer=initializer)
     else:
         raise ValueError(
             f"Unknown interaction {interaction!r}. "
