@@ -58,8 +58,9 @@ import pandas as pd
 import torch
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from src.lloyd.decagon_rank_metrics import apk
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+from src.data.decagon_rank_metrics import apk
 
 
 # ---------------------------------------------------------------------------
