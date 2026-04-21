@@ -6,6 +6,9 @@ This is recommended when running training multiple times (hyperparameter
 sweeps, ablations) because encoding with ChemBERTa and ESM-2 is the
 most expensive step and does not change between runs.
 
+Before running this script, download the raw Decagon data:
+    bash data/raw/download_unpack.sh
+
 Usage:
     python scripts/precompute_embeddings.py \
         --raw_dir data/raw \
@@ -39,11 +42,8 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
-    from src.data import download_decagon, load_decagon
+    from src.data import load_decagon
     from src.model import build_drug_init_tensor, build_protein_init_tensor
-
-    # Download if needed
-    download_decagon(raw_dir=args.raw_dir)
 
     # Load data
     logger.info("Loading Decagon data ...")

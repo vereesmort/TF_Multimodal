@@ -111,9 +111,9 @@ def load_decagon(raw_dir: str = "data/raw") -> DecagonData:
     raw_path = Path(raw_dir)
     data = DecagonData()
 
-    # Decagon files are tab-separated despite the .csv extension, and use
-    # Latin-1 encoding (side effect names contain special characters like °).
-    READ_OPTS = dict(sep="\t", encoding="latin-1")
+    # Decagon CSVs are comma-separated and use Latin-1 encoding
+    # (side effect names contain special characters like °).
+    READ_OPTS = dict(sep=",", encoding="latin-1")
 
     # -- PPI edges --
     ppi_file = raw_path / SNAP_FILES["ppi"][0]
