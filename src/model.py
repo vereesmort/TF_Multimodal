@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, Literal, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -108,6 +108,189 @@ def build_drug_init_tensor(
     return drug_init
 
 
+def _sanitize_hf_id(model_id: str) -> str:
+    return model_id.replace("/", "_").replace(":", "_")
+
+
+def _ablation_mlp_project(
+    feats: torch.Tensor,
+    in_dim: int,
+    embedding_dim: int,
+    seed: int,
+) -> torch.Tensor:
+    """Project modality features to embedding_dim (same depth as fusion MLPs)."""
+    torch.manual_seed(seed)
+    m = nn.Sequential(
+        nn.Linear(in_dim, embedding_dim * 2),
+        nn.LayerNorm(embedding_dim * 2),
+        nn.GELU(),
+        nn.Dropout(0.1),
+        nn.Linear(embedding_dim * 2, embedding_dim),
+    )
+    m.eval()
+    with torch.no_grad():
+        return m(feats)
+
+
+def build_drug_chemberta_only_tensor(
+    drug_to_id: Dict[str, int],
+    drug_smiles: Dict[str, str],
+    embedding_dim: int = 256,
+    chemberta_model: str = "seyonec/ChemBERTa-zinc-base-v1",
+    device: str = "cpu",
+    cache_dir: Optional[str] = None,
+    projection_seed: int = 42,
+) -> torch.Tensor:
+    """
+    ChemBERTa SMILES encoding only, projected to (n_drugs, embedding_dim).
+
+    For ablations that need drug structure signal without monopharmacy SEs.
+    """
+    from src.encoders.drug_encoder import ChemBERTaEncoder
+
+    tag = _sanitize_hf_id(chemberta_model)
+    cache_path = (
+        Path(cache_dir) / f"drug_ablation_chemberta_only_dim{embedding_dim}_{tag}.pt"
+        if cache_dir
+        else None
+    )
+    if cache_path and cache_path.exists():
+        logger.info(f"Loading cached ChemBERTa-only drug init from {cache_path}")
+        return torch.load(cache_path)
+
+    logger.info("Encoding drug SMILES with ChemBERTa (mono-free ablation) ...")
+    cb_encoder = ChemBERTaEncoder(model_name=chemberta_model, device=device)
+    chemberta_feats = cb_encoder.encode_drugs(drug_to_id, drug_smiles)
+    in_dim = chemberta_feats.shape[1]
+    drug_init = _ablation_mlp_project(
+        chemberta_feats, in_dim, embedding_dim, projection_seed
+    )
+
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(drug_init, cache_path)
+        logger.info(f"Cached ChemBERTa-only drug init to {cache_path}")
+
+    return drug_init
+
+
+def build_drug_mono_only_tensor(
+    mono_se_matrix: np.ndarray,
+    embedding_dim: int = 256,
+    mono_method: Literal["tfidf", "cur"] = "tfidf",
+    mono_components: int = 128,
+    cache_dir: Optional[str] = None,
+    projection_seed: int = 42,
+) -> torch.Tensor:
+    """
+    Monopharmacy SE (TF-IDF or CUR) only, projected to (n_drugs, embedding_dim).
+
+    For ablations that need pharmacological SE signal without ChemBERTa.
+    """
+    from src.encoders.drug_encoder import TFIDFMonoEncoder, CURMonoEncoder
+
+    cache_path = (
+        Path(cache_dir)
+        / f"drug_ablation_mono_only_dim{embedding_dim}_{mono_method}_c{mono_components}.pt"
+        if cache_dir
+        else None
+    )
+    if cache_path and cache_path.exists():
+        logger.info(f"Loading cached mono-only drug init from {cache_path}")
+        return torch.load(cache_path)
+
+    logger.info(f"Encoding mono side effects with {mono_method.upper()} (ChemBERTa-free) ...")
+    if mono_method == "tfidf":
+        mono_enc = TFIDFMonoEncoder(n_components=mono_components)
+    elif mono_method == "cur":
+        mono_enc = CURMonoEncoder(n_components=mono_components)
+    else:
+        raise ValueError(f"Unknown mono_method: {mono_method!r}")
+
+    mono_feats_np = mono_enc.fit_transform(mono_se_matrix)
+    mono_feats = torch.tensor(mono_feats_np, dtype=torch.float32)
+    in_dim = mono_feats.shape[1]
+    drug_init = _ablation_mlp_project(mono_feats, in_dim, embedding_dim, projection_seed)
+
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(drug_init, cache_path)
+        logger.info(f"Cached mono-only drug init to {cache_path}")
+
+    return drug_init
+
+
+def build_protein_esm_ppi_ablation_tensors(
+    protein_to_id: Dict[str, int],
+    ppi_edges,
+    protein_sequences: Dict[str, str],
+    embedding_dim: int = 256,
+    esm2_model: str = "facebook/esm2_t6_8M_UR50D",
+    n_hops: int = 1,
+    device: str = "cpu",
+    cache_dir: Optional[str] = None,
+    esm_projection_seed: int = 42,
+    ppi_projection_seed: int = 43,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Two protein matrices for ablation_track1_ml condition E:
+
+      - esm_only:  ESM-2 sequence embedding per protein, projected to embedding_dim
+      - ppi_only:  PPI neighbourhood mean-pool of neighbour ESM-2 vectors (same
+                   esm_dim), projected with a *different* MLP seed so averaging
+                   with esm_only is meaningful.
+
+    Conditions A/B should pass ``esm_only`` as ``--prot_emb_esm2``; pass
+    ``ppi_only`` as ``--prot_emb_ppi`` for condition E.
+
+    Returns:
+        (esm_only, ppi_neighbour_only), each (n_proteins, embedding_dim).
+    """
+    from src.encoders.protein_encoder import ESM2Encoder, PPINeighbourhoodAggregator
+    from src.encoders.protein_encoder import ESM2_DIMS
+
+    esm_tag = esm2_model.split("/")[-1]
+    cache_esm = (
+        Path(cache_dir)
+        / f"protein_ablation_esmself_dim{embedding_dim}_{esm_tag}_h{n_hops}.pt"
+        if cache_dir
+        else None
+    )
+    cache_ppi = (
+        Path(cache_dir)
+        / f"protein_ablation_ppineighbour_dim{embedding_dim}_{esm_tag}_h{n_hops}.pt"
+        if cache_dir
+        else None
+    )
+    if cache_esm and cache_ppi and cache_esm.exists() and cache_ppi.exists():
+        logger.info(f"Loading cached protein ablation tensors from {cache_dir}")
+        return torch.load(cache_esm), torch.load(cache_ppi)
+
+    logger.info("Encoding protein sequences with ESM-2 (ablation branches) ...")
+    esm_encoder = ESM2Encoder(model_name=esm2_model, device=device)
+    esm_self = esm_encoder.encode_proteins(protein_to_id, protein_sequences)
+    esm_dim = ESM2_DIMS.get(esm2_model, 320)
+
+    logger.info(f"Aggregating PPI neighbourhood (n_hops={n_hops}) ...")
+    agg = PPINeighbourhoodAggregator(n_hops=n_hops)
+    esm_neighbourhood = agg.aggregate(esm_self, ppi_edges, protein_to_id)
+
+    esm_only = _ablation_mlp_project(
+        esm_self, esm_dim, embedding_dim, esm_projection_seed
+    )
+    ppi_only = _ablation_mlp_project(
+        esm_neighbourhood, esm_dim, embedding_dim, ppi_projection_seed
+    )
+
+    if cache_esm and cache_ppi:
+        cache_esm.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(esm_only, cache_esm)
+        torch.save(ppi_only, cache_ppi)
+        logger.info(f"Cached protein ablation tensors to {cache_esm} and {cache_ppi}")
+
+    return esm_only, ppi_only
+
+
 def build_protein_init_tensor(
     protein_to_id: Dict[str, int],
     ppi_edges,
@@ -190,6 +373,10 @@ def build_pykeen_model(
     protein_to_id: Dict[str, int],
     interaction: Literal["SimplE", "ComplEx", "DistMult"] = "SimplE",
     embedding_dim: int = 256,
+    loss: str = "CrossEntropyLoss",
+    regularization_weight: float = 1e-3,
+    entity_dropout: Optional[float] = 0.0,
+    relation_dropout: Optional[float] = 0.0,
     random_seed: int = 42,
 ):
     """
@@ -220,6 +407,12 @@ def build_pykeen_model(
         protein_to_id: protein identifier -> integer index.
         interaction: KGE interaction function name.
         embedding_dim: must match drug_init / protein_init dim.
+        loss: loss function name — CrossEntropyLoss | BCEWithLogitsLoss |
+              SoftplusLoss | MarginRankingLoss.
+        regularization_weight: L3 regularization weight on entity/relation
+              embeddings. Set to 0 to disable. (default 1e-3)
+        entity_dropout: Dropout on entity embeddings (0 = off). Lloyd best: 0.068.
+        relation_dropout: Dropout on relation embeddings (0 = off). Lloyd best: 0.125.
         random_seed: for reproducibility.
 
     Returns:
@@ -227,6 +420,8 @@ def build_pykeen_model(
     """
     from pykeen.models import ComplEx, DistMult, SimplE
     from pykeen.nn.init import PretrainedInitializer
+    import pykeen.losses as pykeen_losses
+    from pykeen.regularizers import LpRegularizer
 
     n_entities = len(entity_to_id)
     n_drugs = len(drug_to_id)
@@ -243,11 +438,46 @@ def build_pykeen_model(
         f"embedding_dim: {embedding_dim}"
     )
 
+    # Loss function
+    loss_map = {
+        "CrossEntropyLoss":    pykeen_losses.CrossEntropyLoss,
+        "BCEWithLogitsLoss":   pykeen_losses.BCEWithLogitsLoss,
+        "SoftplusLoss":        pykeen_losses.SoftplusLoss,
+        "MarginRankingLoss":   pykeen_losses.MarginRankingLoss,
+    }
+    if loss not in loss_map:
+        raise ValueError(
+            f"Unknown loss {loss!r}. Choose from: {list(loss_map)}"
+        )
+    loss_instance = loss_map[loss]()
+    logger.info(f"Loss: {loss}")
+
+    # L3 regularization (same as Lloyd et al. SimplE default)
+    regularizer = None
+    if regularization_weight > 0:
+        regularizer = LpRegularizer(p=3, weight=regularization_weight)
+        logger.info(f"L3 regularization weight: {regularization_weight}")
+
     common = dict(
         triples_factory=train_tf,
         embedding_dim=embedding_dim,
+        loss=loss_instance,
         random_seed=random_seed,
     )
+    if regularizer is not None:
+        common["entity_regularizer"] = regularizer
+        common["relation_regularizer"] = regularizer
+
+    # PyKEEN passes these to the underlying Embedding representations.
+    repr_kw: Dict[str, Any] = {}
+    ed = 0.0 if entity_dropout is None else float(entity_dropout)
+    rd = 0.0 if relation_dropout is None else float(relation_dropout)
+    if ed > 0:
+        repr_kw["entity_representations_kwargs"] = {"dropout": ed}
+        logger.info(f"Entity embedding dropout: {ed}")
+    if rd > 0:
+        repr_kw["relation_representations_kwargs"] = {"dropout": rd}
+        logger.info(f"Relation embedding dropout: {rd}")
 
     if interaction == "ComplEx":
         # PyKEEN's ComplEx stores (real, imag) in a single tensor of shape
@@ -256,12 +486,24 @@ def build_pykeen_model(
         entity_init_cpx = torch.stack(
             [entity_init, torch.zeros_like(entity_init)], dim=-1
         )  # (n, d, 2)
-        model = ComplEx(**common, entity_initializer=PretrainedInitializer(tensor=entity_init_cpx))
+        model = ComplEx(
+            **common,
+            entity_initializer=PretrainedInitializer(tensor=entity_init_cpx),
+            **repr_kw,
+        )
     elif interaction == "SimplE":
         # SimplE has two separate (n, d) embeddings — standard shape works.
-        model = SimplE(**common, entity_initializer=PretrainedInitializer(tensor=entity_init))
+        model = SimplE(
+            **common,
+            entity_initializer=PretrainedInitializer(tensor=entity_init),
+            **repr_kw,
+        )
     elif interaction == "DistMult":
-        model = DistMult(**common, entity_initializer=PretrainedInitializer(tensor=entity_init))
+        model = DistMult(
+            **common,
+            entity_initializer=PretrainedInitializer(tensor=entity_init),
+            **repr_kw,
+        )
     else:
         raise ValueError(
             f"Unknown interaction {interaction!r}. "

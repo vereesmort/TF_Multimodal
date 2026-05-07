@@ -52,20 +52,23 @@ Output
 
 Usage
 -----
-  python ablation_track1_ml.py \
-    --combo    bio-decagon-combo.csv \
-    --drug_emb_chemberta  drug_emb_chemberta_256.pt \
-    --drug_emb_mono       drug_emb_mono_256.pt \
-    --prot_emb_esm2       protein_init_dim256_esm2_t30_150M_UR50D.pt \
-    --prot_emb_ppi        protein_emb_ppi_256.pt \
-    --output   ./ablation_results \
+  python ablation_track1_ml.py \\
+    --combo    bio-decagon-combo.csv \\
+    --drug_emb_chemberta  data/cache/ablation/drug_emb_chemberta_256.pt \\
+    --drug_emb_mono       data/cache/ablation/drug_emb_mono_256.pt \\
+    --prot_emb_esm2       data/cache/ablation/protein_emb_esm2_only_dim256_esm2_t30_150M_UR50D.pt \\
+    --prot_emb_ppi        data/cache/ablation/protein_emb_ppi_neighbour_dim256_esm2_t30_150M_UR50D.pt \\
+    --output   ./ablation_results \\
     --seed     42
 
+  Build the *_chemberta_*, *_mono_*, and protein_* tensors with:
+    python scripts/precompute_embeddings_ablation.py --output_dir data/cache/ablation
+
 Minimal run (conditions A–D only, no mono/PPI):
-  python ablation_track1_ml.py \
-    --combo    bio-decagon-combo.csv \
-    --drug_emb_chemberta  drug_emb_chemberta_256.pt \
-    --prot_emb_esm2       protein_init_dim256_esm2_t30_150M_UR50D.pt \
+  python ablation_track1_ml.py \\
+    --combo    bio-decagon-combo.csv \\
+    --drug_emb_chemberta  data/cache/ablation/drug_emb_chemberta_256.pt \\
+    --prot_emb_esm2       data/cache/ablation/protein_emb_esm2_only_dim256_esm2_t30_150M_UR50D.pt \\
     --output   ./ablation_results
 """
 
