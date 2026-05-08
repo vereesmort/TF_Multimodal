@@ -16,17 +16,21 @@ Tree-based models are used here because:
 
 Conditions
 ----------
-  A  ChemBERTa + ESM-2               (pure pretrained, no extras)
-  B  zeros + ESM-2                   (protein only — isolates protein signal)
-  C  ChemBERTa + zeros               (drug only — isolates drug signal)
-  D  random Xavier + random Xavier   (graph topology anchor — Lloyd baseline)
-  E  ChemBERTa+mono + ESM-2+PPI      (your full model — does fusion help?)
+  A  [ ChemBERTa || drug-via-ESM ]   (hstack, D_d + D_p e.g. 128+128=256)
+  B  [ 0^{D_d} || drug-via-ESM ]     (protein signal only, drug slot zero)
+  C  [ ChemBERTa || 0^{D_p} ]        (drug signal only, protein slot zero)
+  D  [ Xavier_d || Xavier_p ]        (independent random per-drug slots)
+  E  [ (ChemBERTa+mono)/2 || (drug-via-ESM + drug-via-PPI)/2 ]  (hstack; each
+     branch can be mean-fused internally when two tensors share a modality)
 
 Feature construction for a drug pair (drug_A, drug_B, side_effect_r)
 ---------------------------------------------------------------------
 Tree models cannot directly use the SimplE scoring function.
-Instead, we construct a fixed-size feature vector for each drug pair by
-combining the two drug embeddings and (optionally) the SE relation embedding.
+Each drug has a **fused** vector of size ``D_d + D_p`` (e.g. 256) built by
+**concatenating** the drug branch (width ``D_d``) and the protein branch
+(width ``D_p``). The protein branch is **target-mean** ESM-2 (and for E, also
+PPI) from ``bio-decagon-targets.csv`` (drug→gene→embedding row). The ``+`` in
+older docs meant element-wise sum; the default now is **hstack** (``torch.cat``).
 
 Combination strategies:
   - concatenate:   [e_A || e_B]                  (2×dim features)
@@ -46,10 +50,10 @@ Ratio: 1 positive : 1 negative (balanced). Seed-controlled for reproducibility.
 
 Memory / scaling
 ----------------
-Rough size of the feature matrix alone: ``n_samples × (8 × dim)`` bytes
-(float32 product + float32 abs-diff halves). Example: 5M samples × dim 256
-→ ~10 GB for ``X``. Train/test slicing previously duplicated the full matrix;
-the pipeline deletes ``X`` after taking train/test slices. Per-condition results
+Rough size of the feature matrix alone: ``n_samples × (8 × (D_d + D_p))`` bytes
+(float32 product + float32 abs-diff over fused length ``D_d + D_p``).
+Example: 5M samples and ``D_d+D_p`` = 256 → ~10 GB for ``X`` alone.
+The pipeline deletes ``X`` after taking train/test slices. Per-condition results
 are appended to CSV as each model finishes (no giant list of DataFrames).
 
 Use ``--n_se_sample`` with ``--se_offset`` to process side effects in batches
@@ -67,6 +71,7 @@ Usage
 -----
   python ablation_track1_ml.py \\
     --combo    bio-decagon-combo.csv \\
+    --targets  bio-decagon-targets.csv \\
     --drug_emb_chemberta  data/cache/ablation/drug_emb_chemberta_256.pt \\
     --drug_emb_mono       data/cache/ablation/drug_emb_mono_256.pt \\
     --prot_emb_esm2       data/cache/ablation/protein_emb_esm2_only_dim256_esm2_t30_150M_UR50D.pt \\
@@ -80,6 +85,7 @@ Usage
   Minimal run (conditions A–D only, no mono/PPI):
   python ablation_track1_ml.py \\
     --combo    bio-decagon-combo.csv \\
+    --targets  bio-decagon-targets.csv \\
     --drug_emb_chemberta  data/cache/ablation/drug_emb_chemberta_256.pt \\
     --prot_emb_esm2       data/cache/ablation/protein_emb_esm2_only_dim256_esm2_t30_150M_UR50D.pt \\
     --output   ./ablation_results
@@ -101,6 +107,8 @@ import gc
 import hashlib
 import json
 import warnings
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import torch
@@ -126,6 +134,14 @@ def parse_args():
                    help="(n_proteins, 256) tensor — PPI mean-pool embeddings")
     p.add_argument("--entity_to_id",       default=None,
                    help=".json mapping entity string → row index in embedding tensors")
+    p.add_argument("--targets",            default=None,
+                   help="bio-decagon-targets.csv (STITCH, Gene). Required for conditions A, B, E.")
+    p.add_argument("--prot_gene_idx",      default=None,
+                   help="JSON mapping Gene string → row index in --prot_emb_esm2 / --prot_emb_ppi. "
+                        "If omitted, rows are assumed 0..G-1 for Genes sorted unique in targets (fragile).")
+    p.add_argument("--target_impute",      default="zero",
+                   choices=["zero", "mean"],
+                   help="Drugs with no resolvable targets: zero vector or global mean protein embedding.")
     p.add_argument("--output",             default="./ablation_results")
     p.add_argument("--seed",               type=int,  default=42)
     p.add_argument("--neg_ratio",          type=int,  default=1,
@@ -205,7 +221,129 @@ def make_entity_index(df: pd.DataFrame):
     return drug_to_idx
 
 
-# ── Embedding conditions ───────────────────────────────────────────────────────
+def load_targets_table(path: str) -> pd.DataFrame:
+    """bio-decagon-targets.csv with columns STITCH, Gene."""
+    t = pd.read_csv(path)
+    if "STITCH" not in t.columns or "Gene" not in t.columns:
+        raise ValueError(f"{path}: expected columns STITCH and Gene")
+    t = t.copy()
+    t["STITCH"] = t["STITCH"].astype(str)
+    t["Gene"] = t["Gene"].astype(str)
+    return t
+
+
+def resolve_gene_to_row(
+    n_prot_rows: int,
+    targets: pd.DataFrame,
+    prot_gene_idx: str | None,
+) -> dict[str, int]:
+    """Map Gene ID → row index into prot_emb tensor."""
+    if prot_gene_idx:
+        with open(prot_gene_idx) as f:
+            raw = json.load(f)
+        return {str(k): int(v) for k, v in raw.items()}
+    genes = sorted(targets["Gene"].unique())
+    if len(genes) > n_prot_rows:
+        raise ValueError(
+            f"{len(genes)} unique Genes in targets but protein embedding has only "
+            f"{n_prot_rows} rows — pass --prot_gene_idx with Gene→row indices."
+        )
+    print(
+        "WARNING: Using Gene order = sorted unique Genes in targets → rows 0..G-1 "
+        "of prot_emb. If your ESM tensor uses a different ordering, pass --prot_gene_idx."
+    )
+    return {g: i for i, g in enumerate(genes)}
+
+
+def compute_drug_via_targets(
+    prot_emb: torch.Tensor,
+    targets: pd.DataFrame,
+    drug_to_idx: dict[str, int],
+    gene_to_row: dict[str, int],
+    impute: str,
+) -> torch.Tensor:
+    """
+    Mean protein embedding over target genes per drug (aligned with drug_to_idx rows).
+    """
+    dim = prot_emb.shape[1]
+    n_drugs = len(drug_to_idx)
+    drug_targets: dict[str, list[str]] = defaultdict(list)
+    for _, row in targets.iterrows():
+        drug_targets[row["STITCH"]].append(row["Gene"])
+
+    if impute == "zero":
+        fallback = torch.zeros(dim, dtype=prot_emb.dtype, device=prot_emb.device)
+    else:
+        fallback = prot_emb.mean(dim=0)
+
+    out = torch.zeros(n_drugs, dim, dtype=prot_emb.dtype, device=prot_emb.device)
+    for drug, idx in drug_to_idx.items():
+        genes = drug_targets.get(drug, [])
+        ok = [g for g in genes if g in gene_to_row]
+        if ok:
+            rows = []
+            for g in ok:
+                r = gene_to_row[g]
+                if r < 0 or r >= prot_emb.shape[0]:
+                    raise IndexError(
+                        f"Gene {g} maps to row {r}; prot_emb has shape {tuple(prot_emb.shape)}"
+                    )
+                rows.append(r)
+            out[idx] = prot_emb[rows].mean(dim=0)
+        else:
+            out[idx] = fallback
+    return out
+
+
+def build_fused_drug_embedding_matrix(
+    condition: str,
+    n_drugs: int,
+    drug_dim: int,
+    prot_dim: int,
+    seed: int,
+    chemberta: torch.Tensor | None,
+    mono: torch.Tensor | None,
+    via_esm: torch.Tensor | None,
+    via_ppi: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    Per-drug vector for pair features: ``torch.cat([drug_branch, prot_branch], dim=1)``.
+
+    Shapes: ``(n_drugs, drug_dim + prot_dim)``. Drug width ``drug_dim`` comes from
+    ChemBERTa (and mono for E); protein width ``prot_dim`` from ``--prot_emb_esm2``.
+    """
+    drug_branch = build_drug_embeddings(
+        condition, n_drugs, chemberta, mono, drug_dim, seed)
+
+    def _hstack(drug_b: torch.Tensor, prot_b: torch.Tensor) -> torch.Tensor:
+        return torch.cat([drug_b, prot_b], dim=1)
+
+    if condition == "A":
+        if via_esm is None:
+            raise ValueError("Condition A requires --targets and ESM protein embeddings.")
+        return _hstack(drug_branch, via_esm)
+
+    if condition == "B":
+        if via_esm is None:
+            raise ValueError("Condition B requires --targets and ESM protein embeddings.")
+        return _hstack(drug_branch, via_esm)
+
+    if condition == "C":
+        return _hstack(drug_branch, zero_tensor(n_drugs, prot_dim))
+
+    if condition == "D":
+        prot_slot = xavier_tensor(n_drugs, prot_dim, seed + 1)
+        return _hstack(drug_branch, prot_slot)
+
+    if condition == "E":
+        if via_esm is None or via_ppi is None:
+            raise ValueError(
+                "Condition E requires --targets, --prot_emb_esm2, and --prot_emb_ppi."
+            )
+        prot_branch = (via_esm + via_ppi) / 2.0
+        return _hstack(drug_branch, prot_branch)
+
+    raise ValueError(f"Unknown condition: {condition}")
 
 def zero_tensor(n_entities: int, dim: int) -> torch.Tensor:
     return torch.zeros(n_entities, dim)
@@ -255,12 +393,8 @@ def build_protein_embeddings(condition: str,
                              dim: int,
                              seed: int) -> torch.Tensor:
     """
-    Return (n_proteins, dim) protein embedding matrix for a given condition.
-
-    Condition controls the protein side:
-      A, B, E  →  ESM-2 (+ PPI for E)
-      C        →  zeros
-      D        →  Xavier random
+    Legacy: per-residue/gene protein stacks — not used once fused drug matrices
+    (build_fused_drug_embedding_matrix + compute_drug_via_targets) are enabled.
     """
     if condition in ("A", "B"):
         assert esm2 is not None, "ESM-2 embeddings required for condition A/B"
@@ -403,6 +537,10 @@ def _dataset_cache_signature(args: argparse.Namespace,
         "min_edges": args.min_edges,
         "se_offset": args.se_offset,
         "n_se_sample": sorted(se_sample) if se_sample else None,
+        "targets": Path(args.targets).name if args.targets else None,
+        "target_impute": args.target_impute,
+        "prot_gene_idx": Path(args.prot_gene_idx).name if args.prot_gene_idx else None,
+        "fusion": "hstack_drug_prot",
     }
     blob = json.dumps(meta, sort_keys=True).encode()
     return hashlib.md5(blob).hexdigest()[:12]
@@ -612,8 +750,10 @@ def main():
     esm2      = load_tensor(args.prot_emb_esm2)
     ppi       = load_tensor(args.prot_emb_ppi)
 
-    dim = chemberta.shape[1] if chemberta is not None else esm2.shape[1]
-    print(f"Embedding dim: {dim}")
+    drug_dim = chemberta.shape[1]
+    prot_dim = esm2.shape[1]
+    fused_dim = drug_dim + prot_dim
+    print(f"Drug branch dim: {drug_dim}, protein branch dim: {prot_dim}, fused: {fused_dim}")
 
     drug_to_idx = make_entity_index(df)
     n_drugs     = len(drug_to_idx)
@@ -657,6 +797,35 @@ def main():
     models_to_run = (["xgboost", "catboost"] if args.model == "both"
                      else [args.model])
 
+    need_targets = bool(set(conditions) & {"A", "B", "E"})
+    if need_targets and not args.targets:
+        raise ValueError(
+            "Conditions A, B, or E require --targets (e.g. bio-decagon-targets.csv) "
+            "to build drug→target→mean(protein embedding) vectors."
+        )
+
+    via_esm = None
+    via_ppi = None
+    if need_targets:
+        targets_df = load_targets_table(args.targets)
+        gene_to_row = resolve_gene_to_row(esm2.shape[0], targets_df, args.prot_gene_idx)
+        via_esm = compute_drug_via_targets(
+            esm2, targets_df, drug_to_idx, gene_to_row, args.target_impute
+        )
+        print(f"  drug-via-ESM (mean over targets): {tuple(via_esm.shape)}")
+        if "E" in conditions:
+            if ppi is None:
+                raise ValueError("Condition E requires --prot_emb_ppi.")
+            if ppi.shape[0] != esm2.shape[0]:
+                raise ValueError(
+                    "For condition E, --prot_emb_ppi must have the same number of rows as "
+                    "--prot_emb_esm2 when using one --prot_gene_idx mapping."
+                )
+            via_ppi = compute_drug_via_targets(
+                ppi, targets_df, drug_to_idx, gene_to_row, args.target_impute
+            )
+            print(f"  drug-via-PPI (mean over targets): {tuple(via_ppi.shape)}")
+
     wandb_run = None
     if args.wandb:
         try:
@@ -690,7 +859,11 @@ def main():
                 "max_pos_edges": args.max_pos_edges,
                 "dataset_cache_dir": args.dataset_cache_dir,
                 "reuse_dataset_cache": args.reuse_dataset_cache,
-                "embedding_dim": dim,
+                "targets": args.targets,
+                "target_impute": args.target_impute,
+                "embedding_dim": fused_dim,
+                "drug_dim": drug_dim,
+                "prot_dim": prot_dim,
                 "n_drugs": n_drugs,
                 "n_proteins": n_proteins,
                 "conditions": conditions,
@@ -724,28 +897,12 @@ def main():
             X, y, se_labels, degrees = load_dataset_npz(cache_npz)
             print(f"  Dataset: loaded cache {cache_npz.name} (skipping drug_emb + build_dataset)")
         else:
-            drug_emb = build_drug_embeddings(
-                condition, n_drugs, chemberta, mono, dim, args.seed)
+            drug_emb = build_fused_drug_embedding_matrix(
+                condition, n_drugs, drug_dim, prot_dim, args.seed,
+                chemberta, mono, via_esm, via_ppi,
+            )
 
-            # NOTE: protein embeddings are not directly used in the tree model
-            # feature vector because we only have drug-drug pairs in combo.csv.
-            # Proteins connect to drugs via the targets file, not directly via pairs.
-            # Two options:
-            #
-            # Option 1 (implemented here — simpler):
-            #   Aggregate protein embeddings per drug via drug→target→ESM-2.
-            #   Each drug gets a mean of its target protein ESM-2 vectors.
-            #   This "drug via targets" embedding is concatenated with the
-            #   drug's own embedding before pair feature construction.
-            #
-            # Option 2 (more faithful to KGE):
-            #   Train a full KGE and use the learned entity embeddings.
-            #   This is what the main HPO script does.
-            #
-            # For the ablation, Option 1 is appropriate because we want to
-            # isolate embedding contributions without KGE training confounding.
-
-            print(f"  Drug embedding: {drug_emb.shape}")
+            print(f"  Fused per-drug embedding (hstack): {drug_emb.shape}")
 
             print(f"  Building dataset...")
             X, y, se_labels, degrees = build_dataset(
@@ -807,7 +964,7 @@ def main():
             per_se_first = append_per_se_results(
                 results_per_se_path, results_df, per_se_first)
 
-            save_feature_importance(clf, condition, dim, output_dir, model_name)
+            save_feature_importance(clf, condition, fused_dim, output_dir, model_name)
 
             overall_auroc = roc_auc_score(y_test, y_score)
             overall_auprc = average_precision_score(y_test, y_score)
