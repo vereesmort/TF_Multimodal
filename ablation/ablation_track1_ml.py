@@ -64,12 +64,15 @@ Usage
   Build the *_chemberta_*, *_mono_*, and protein_* tensors with:
     python scripts/precompute_embeddings_ablation.py --output_dir data/cache/ablation
 
-Minimal run (conditions A–D only, no mono/PPI):
+  Minimal run (conditions A–D only, no mono/PPI):
   python ablation_track1_ml.py \\
     --combo    bio-decagon-combo.csv \\
     --drug_emb_chemberta  data/cache/ablation/drug_emb_chemberta_256.pt \\
     --prot_emb_esm2       data/cache/ablation/protein_emb_esm2_only_dim256_esm2_t30_150M_UR50D.pt \\
     --output   ./ablation_results
+
+  With Weights & Biases (requires `pip install wandb` and `wandb login`):
+  python ablation_track1_ml.py ... --wandb --wandb_project my-project --wandb_tags track1,ablation
 """
 
 import argparse
@@ -111,6 +114,19 @@ def parse_args():
                    help="Lloyd's threshold — 963 SEs")
     p.add_argument("--n_se_sample",        type=int,  default=None,
                    help="Subsample N side effects for fast testing (None = all 963)")
+    # Weights & Biases (optional)
+    p.add_argument("--wandb", action="store_true",
+                   help="Log metrics and config to Weights & Biases")
+    p.add_argument("--wandb_project", default="tf-multimodal-track1-ablation",
+                   help="W&B project name")
+    p.add_argument("--wandb_entity", default=None,
+                   help="W&B entity (team or username); None uses default account")
+    p.add_argument("--wandb_run_name", default=None,
+                   help="W&B run name (default: auto-generated)")
+    p.add_argument("--wandb_tags", default=None,
+                   help="Comma-separated W&B run tags")
+    p.add_argument("--wandb_offline", action="store_true",
+                   help="Use W&B offline mode (sync later with wandb sync)")
     return p.parse_args()
 
 
@@ -397,9 +413,7 @@ def train_xgboost(X_train, y_train, X_test, seed: int):
         n_jobs=-1,
         verbosity=0,
     )
-    clf.fit(X_train, y_train,
-            eval_set=[(X_test, y_test := None)],  # no early stopping here
-            verbose=False)
+    clf.fit(X_train, y_train, verbose=False)
     return clf, clf.predict_proba(X_test)[:, 1]
 
 
@@ -516,7 +530,44 @@ def main():
     models_to_run = (["xgboost", "catboost"] if args.model == "both"
                      else [args.model])
 
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError as e:
+            raise ImportError(
+                "Weights & Biases requires the wandb package: pip install wandb"
+            ) from e
+        tags = None
+        if args.wandb_tags:
+            tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+            if not tags:
+                tags = None
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            tags=tags,
+            mode="offline" if args.wandb_offline else "online",
+            config={
+                "combo": Path(args.combo).name,
+                "output_dir": str(output_dir.resolve()),
+                "seed": args.seed,
+                "neg_ratio": args.neg_ratio,
+                "test_frac": args.test_frac,
+                "model_policy": args.model,
+                "min_edges": args.min_edges,
+                "n_se_sample": args.n_se_sample,
+                "embedding_dim": dim,
+                "n_drugs": n_drugs,
+                "n_proteins": n_proteins,
+                "conditions": conditions,
+                "models_to_run": models_to_run,
+            },
+        )
+
     all_results = []
+    wandb_step = 0
 
     for condition in conditions:
         print(f"\n{'─'*40}")
@@ -579,10 +630,34 @@ def main():
             # Feature importance
             save_feature_importance(clf, condition, dim, output_dir, model_name)
 
+            overall_auroc = roc_auc_score(y_test, y_score)
+            overall_auprc = average_precision_score(y_test, y_score)
+
             # Quick summary
             print(f"  {model_name} — overall AUROC: "
-                  f"{roc_auc_score(y_test, y_score):.4f}  "
-                  f"AUPRC: {average_precision_score(y_test, y_score):.4f}")
+                  f"{overall_auroc:.4f}  "
+                  f"AUPRC: {overall_auprc:.4f}")
+
+            if wandb_run is not None:
+                import wandb
+
+                log_payload = {
+                    "overall/auroc": overall_auroc,
+                    "overall/auprc": overall_auprc,
+                    "per_se/median_auroc": float(results_df["auroc"].median()),
+                    "per_se/median_auprc": float(results_df["auprc"].median()),
+                    "bias/degree_score_corr": float(
+                        results_df["degree_score_corr"].iloc[0]),
+                    "samples/n_test": int(len(y_test)),
+                    "samples/n_pos_test": int(y_test.sum()),
+                    "meta/condition": condition,
+                    "meta/model": model_name,
+                }
+                for tier, val in results_df.groupby("tier")["auprc"].median().items():
+                    log_payload[f"tier/median_auprc/{tier}"] = float(val)
+
+                wandb.log(log_payload, step=wandb_step)
+                wandb_step += 1
 
     # ── Aggregate results ──────────────────────────────────────────────────
     all_df = pd.concat(all_results, ignore_index=True)
@@ -614,6 +689,18 @@ def main():
     print(bias.to_string(index=False))
 
     print(f"\nResults saved to: {output_dir}")
+
+    if wandb_run is not None:
+        import wandb
+
+        wandb.log({
+            "tables/ablation_summary": wandb.Table(dataframe=summary),
+            "tables/bias_by_condition": wandb.Table(dataframe=bias),
+        })
+        for _, row in summary.iterrows():
+            key = f"final/median_auprc/{row['condition']}/{row['tier']}"
+            wandb.summary[key] = float(row["median_auprc"])
+        wandb.finish()
 
 
 if __name__ == "__main__":
