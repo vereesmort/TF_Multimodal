@@ -44,6 +44,19 @@ The polypharmacy graph only contains positive pairs. We generate negatives
 by corrupting one drug in each positive pair (standard KGE negative sampling).
 Ratio: 1 positive : 1 negative (balanced). Seed-controlled for reproducibility.
 
+Memory / scaling
+----------------
+Rough size of the feature matrix alone: ``n_samples × (8 × dim)`` bytes
+(float32 product + float32 abs-diff halves). Example: 5M samples × dim 256
+→ ~10 GB for ``X``. Train/test slicing previously duplicated the full matrix;
+the pipeline deletes ``X`` after taking train/test slices. Per-condition results
+are appended to CSV as each model finishes (no giant list of DataFrames).
+
+Use ``--n_se_sample`` with ``--se_offset`` to process side effects in batches
+(resume later without ``--max_pos_edges``). Put ``--output`` and
+``--dataset_cache_dir`` on Colab VM local storage (e.g. ``/content/...``) to
+avoid Google Drive sync latency; Drive mounts add network I/O.
+
 Output
 ------
   ablation_results.csv     — per-condition AUROC, AUPRC, AP@50 per SE tier
@@ -73,15 +86,25 @@ Usage
 
   With Weights & Biases (requires `pip install wandb` and `wandb login`):
   python ablation_track1_ml.py ... --wandb --wandb_project my-project --wandb_tags track1,ablation
+
+  Colab: use VM-local paths (fast): ``--output /content/ablation_out``
+  ``--dataset_cache_dir /content/ablation_cache``. Avoid ``/content/drive/MyDrive/...``
+  for heavy .npz I/O unless you need persistence across runtime disconnects.
+
+  Batched SEs (resume without max_pos_edges): SEs are ordered by decreasing
+  edge count. Run batch 0: ``--n_se_sample 100 --se_offset 0``; batch 1:
+  ``--n_se_sample 100 --se_offset 100 --append_se_results`` (same ``--output``).
 """
 
 import argparse
+import gc
+import hashlib
+import json
 import warnings
 import numpy as np
 import pandas as pd
 import torch
 from pathlib import Path
-from collections import defaultdict
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.model_selection import train_test_split
 
@@ -113,7 +136,24 @@ def parse_args():
     p.add_argument("--min_edges",          type=int,  default=500,
                    help="Lloyd's threshold — 963 SEs")
     p.add_argument("--n_se_sample",        type=int,  default=None,
-                   help="Subsample N side effects for fast testing (None = all 963)")
+                   help="If set, only use this many side effects per run. Combine with "
+                        "--se_offset to resume the next chunk (SEs ordered by decreasing edge count).")
+    p.add_argument("--se_offset",          type=int,  default=0,
+                   help="Skip the first N side effects in the canonical frequency-sorted list "
+                        "(used with --n_se_sample for batched / resume runs).")
+    p.add_argument("--append_se_results", action="store_true",
+                   help="If ablation_results_per_se.csv already exists under --output, append "
+                        "new rows instead of overwriting (for merging SE batches).")
+    p.add_argument("--max_pos_edges",      type=int,  default=None,
+                   help="Cap positive edges after filtering (random subsample, seed-controlled). "
+                        "Cuts RAM ~linearly in this cap.")
+    p.add_argument("--dataset_cache_dir",  default=None,
+                   help="If set, save each condition's built arrays under this directory as .npz "
+                        "(see --reuse_dataset_cache). Uses disk; lowers repeated-run RAM if you "
+                        "resume without rebuilding.")
+    p.add_argument("--reuse_dataset_cache", action="store_true",
+                   help="If --dataset_cache_dir is set and a cache file exists for a condition, "
+                        "load it instead of calling build_dataset (same CLI args must apply).")
     # Weights & Biases (optional)
     p.add_argument("--wandb", action="store_true",
                    help="Log metrics and config to Weights & Biases")
@@ -260,12 +300,15 @@ def build_dataset(df: pd.DataFrame,
                   drug_to_idx: dict,
                   neg_ratio: int,
                   seed: int,
-                  se_sample: list | None = None):
+                  se_sample: list | None = None,
+                  max_pos_edges: int | None = None):
     """
     Build (X, y, se_labels) arrays for binary classification.
 
     Positives: real drug pairs from combo CSV.
     Negatives: corrupt one drug per positive (standard KGE negative sampling).
+
+    Memory: one preallocated float32 matrix (no Python lists of row arrays).
 
     Returns
     -------
@@ -278,54 +321,120 @@ def build_dataset(df: pd.DataFrame,
     all_drug_ids = list(drug_to_idx.keys())
     n_drugs = len(all_drug_ids)
 
-    emb = drug_emb.numpy()
+    emb = np.ascontiguousarray(
+        drug_emb.detach().cpu().numpy(), dtype=np.float32)
     dim = emb.shape[1]
+    feat_dim = 2 * dim
 
     if se_sample is not None:
         df = df[df["Polypharmacy Side Effect"].isin(se_sample)]
 
-    # Drug degree (number of pairs each drug appears in)
-    degree = defaultdict(int)
-    for _, row in df.iterrows():
-        degree[row["STITCH 1"]] += 1
-        degree[row["STITCH 2"]] += 1
+    mask = df["STITCH 1"].isin(drug_to_idx) & df["STITCH 2"].isin(drug_to_idx)
+    df = df.loc[mask]
+    if len(df) == 0:
+        return (
+            np.empty((0, feat_dim), dtype=np.float32),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=object),
+            np.empty(0, dtype=np.float32),
+        )
 
-    X_pos, X_neg = [], []
-    se_pos, se_neg = [], []
-    deg_pos, deg_neg = [], []
+    if max_pos_edges is not None and len(df) > max_pos_edges:
+        df = df.sample(n=max_pos_edges, random_state=seed)
+        print(f"  Subsampled positives to --max_pos_edges={max_pos_edges:,}")
 
-    for _, row in df.iterrows():
-        a, b, se = row["STITCH 1"], row["STITCH 2"], row["Polypharmacy Side Effect"]
-        if a not in drug_to_idx or b not in drug_to_idx:
-            continue
+    stacked = pd.concat([df["STITCH 1"], df["STITCH 2"]], ignore_index=True)
+    degree = stacked.value_counts().to_dict()
 
-        ea = emb[drug_to_idx[a]]
-        eb = emb[drug_to_idx[b]]
-        X_pos.append(pair_features(ea, eb))
-        se_pos.append(se)
-        deg_pos.append(degree[a] * degree[b])
+    n_pos = len(df)
+    n_samples = n_pos * (1 + neg_ratio)
 
-        # Generate neg_ratio corrupted negatives
+    s1 = df["STITCH 1"].to_numpy()
+    s2 = df["STITCH 2"].to_numpy()
+    se_col = df["Polypharmacy Side Effect"].to_numpy()
+
+    X = np.empty((n_samples, feat_dim), dtype=np.float32)
+    y = np.empty(n_samples, dtype=np.int32)
+    se_labels = np.empty(n_samples, dtype=object)
+    degrees = np.empty(n_samples, dtype=np.float32)
+
+    row = 0
+    for i in range(n_pos):
+        a, b, se = s1[i], s2[i], se_col[i]
+        ia, ib = drug_to_idx[a], drug_to_idx[b]
+        ea, eb = emb[ia], emb[ib]
+        X[row, :dim] = ea * eb
+        X[row, dim:] = np.abs(ea - eb)
+        y[row] = 1
+        se_labels[row] = se
+        degrees[row] = np.float32(degree[a] * degree[b])
+        row += 1
+
         for _ in range(neg_ratio):
-            # Corrupt drug A or B with equal probability
             if rng.rand() < 0.5:
                 neg_drug = all_drug_ids[rng.randint(n_drugs)]
-                ec = emb[drug_to_idx[neg_drug]]
-                X_neg.append(pair_features(ec, eb))
-                deg_neg.append(degree[neg_drug] * degree[b])
+                ic = drug_to_idx[neg_drug]
+                ec = emb[ic]
+                X[row, :dim] = ec * eb
+                X[row, dim:] = np.abs(ec - eb)
+                degrees[row] = np.float32(degree[neg_drug] * degree[b])
             else:
                 neg_drug = all_drug_ids[rng.randint(n_drugs)]
-                ec = emb[drug_to_idx[neg_drug]]
-                X_neg.append(pair_features(ea, ec))
-                deg_neg.append(degree[a] * degree[neg_drug])
-            se_neg.append(se)
+                ic = drug_to_idx[neg_drug]
+                ec = emb[ic]
+                X[row, :dim] = ea * ec
+                X[row, dim:] = np.abs(ea - ec)
+                degrees[row] = np.float32(degree[a] * degree[neg_drug])
+            y[row] = 0
+            se_labels[row] = se
+            row += 1
 
-    X = np.array(X_pos + X_neg, dtype=np.float32)
-    y = np.array([1] * len(X_pos) + [0] * len(X_neg), dtype=np.int32)
-    se_labels = np.array(se_pos + se_neg)
-    degrees = np.array(deg_pos + deg_neg, dtype=np.float64)
-
+    assert row == n_samples
     return X, y, se_labels, degrees
+
+
+def _dataset_cache_signature(args: argparse.Namespace,
+                             se_sample: list | None) -> str:
+    meta = {
+        "combo": Path(args.combo).name,
+        "seed": args.seed,
+        "neg_ratio": args.neg_ratio,
+        "max_pos_edges": args.max_pos_edges,
+        "min_edges": args.min_edges,
+        "se_offset": args.se_offset,
+        "n_se_sample": sorted(se_sample) if se_sample else None,
+    }
+    blob = json.dumps(meta, sort_keys=True).encode()
+    return hashlib.md5(blob).hexdigest()[:12]
+
+
+def save_dataset_npz(path: Path, X, y, se_labels, degrees,
+                     meta: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        X=X,
+        y=y,
+        se_labels=se_labels,
+        degrees=degrees,
+        meta_json=json.dumps(meta),
+    )
+
+
+def load_dataset_npz(path: Path):
+    z = np.load(path, allow_pickle=True)
+    X = np.ascontiguousarray(z["X"], dtype=np.float32)
+    y = np.ascontiguousarray(z["y"])
+    se_labels = z["se_labels"]
+    degrees = np.ascontiguousarray(z["degrees"], dtype=np.float32)
+    z.close()
+    return X, y, se_labels, degrees
+
+
+def append_per_se_results(path: Path, df: pd.DataFrame, is_first: bool) -> bool:
+    """Write or append rows to ablation_results_per_se.csv. is_first: first write this run."""
+    df.to_csv(path, mode="w" if is_first else "a", index=False, header=is_first)
+    return False
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -514,11 +623,29 @@ def main():
     se_counts = df.groupby("Polypharmacy Side Effect").size()
     tier_map  = assign_tiers(se_counts)
 
-    # Optional SE subsampling for fast testing
+    # Side-effect subsampling: canonical order = decreasing edge count (stable resume batches)
+    ordered_se = se_counts.sort_values(ascending=False).index.tolist()
+    n_se_total = len(ordered_se)
     se_sample = None
     if args.n_se_sample is not None:
-        se_sample = list(se_counts.index[:args.n_se_sample])
-        print(f"Subsampling to {args.n_se_sample} SEs for fast testing")
+        start = max(0, args.se_offset)
+        end = min(start + args.n_se_sample, n_se_total)
+        if start >= n_se_total:
+            raise RuntimeError(
+                f"--se_offset={start} is past the {n_se_total} side effects "
+                f"(after --min_edges filter)."
+            )
+        se_sample = ordered_se[start:end]
+        if len(se_sample) == 0:
+            raise RuntimeError(
+                "Empty SE slice; increase --n_se_sample or lower --se_offset."
+            )
+        print(
+            f"SE slice [{start}:{end}] of {n_se_total} (by decreasing edge count): "
+            f"{len(se_sample)} side effects"
+        )
+    elif args.se_offset != 0:
+        raise ValueError("--se_offset is only meaningful together with --n_se_sample")
 
     # Determine which conditions to run
     conditions = ["A", "B", "C", "D"]
@@ -558,6 +685,11 @@ def main():
                 "model_policy": args.model,
                 "min_edges": args.min_edges,
                 "n_se_sample": args.n_se_sample,
+                "se_offset": args.se_offset,
+                "append_se_results": args.append_se_results,
+                "max_pos_edges": args.max_pos_edges,
+                "dataset_cache_dir": args.dataset_cache_dir,
+                "reuse_dataset_cache": args.reuse_dataset_cache,
                 "embedding_dim": dim,
                 "n_drugs": n_drugs,
                 "n_proteins": n_proteins,
@@ -566,74 +698,120 @@ def main():
             },
         )
 
-    all_results = []
+    cache_sig = _dataset_cache_signature(args, se_sample)
+    results_per_se_path = output_dir / "ablation_results_per_se.csv"
+    if args.append_se_results and results_per_se_path.is_file():
+        per_se_first = False
+        print(f"Appending per-SE results to existing file: {results_per_se_path}")
+    else:
+        per_se_first = True
     wandb_step = 0
 
     for condition in conditions:
         print(f"\n{'─'*40}")
         print(f"Condition {condition}")
 
-        # Build drug embedding matrix for this condition
-        drug_emb = build_drug_embeddings(
-            condition, n_drugs, chemberta, mono, dim, args.seed)
+        cache_npz = None
+        if args.dataset_cache_dir:
+            cache_npz = Path(args.dataset_cache_dir).resolve() / f"{condition}_{cache_sig}.npz"
 
-        # NOTE: protein embeddings are not directly used in the tree model
-        # feature vector because we only have drug-drug pairs in combo.csv.
-        # Proteins connect to drugs via the targets file, not directly via pairs.
-        # Two options:
-        #
-        # Option 1 (implemented here — simpler):
-        #   Aggregate protein embeddings per drug via drug→target→ESM-2.
-        #   Each drug gets a mean of its target protein ESM-2 vectors.
-        #   This "drug via targets" embedding is concatenated with the
-        #   drug's own embedding before pair feature construction.
-        #
-        # Option 2 (more faithful to KGE):
-        #   Train a full KGE and use the learned entity embeddings.
-        #   This is what the main HPO script does.
-        #
-        # For the ablation, Option 1 is appropriate because we want to
-        # isolate embedding contributions without KGE training confounding.
+        if (
+            args.dataset_cache_dir
+            and args.reuse_dataset_cache
+            and cache_npz is not None
+            and cache_npz.is_file()
+        ):
+            X, y, se_labels, degrees = load_dataset_npz(cache_npz)
+            print(f"  Dataset: loaded cache {cache_npz.name} (skipping drug_emb + build_dataset)")
+        else:
+            drug_emb = build_drug_embeddings(
+                condition, n_drugs, chemberta, mono, dim, args.seed)
 
-        print(f"  Drug embedding: {drug_emb.shape}")
+            # NOTE: protein embeddings are not directly used in the tree model
+            # feature vector because we only have drug-drug pairs in combo.csv.
+            # Proteins connect to drugs via the targets file, not directly via pairs.
+            # Two options:
+            #
+            # Option 1 (implemented here — simpler):
+            #   Aggregate protein embeddings per drug via drug→target→ESM-2.
+            #   Each drug gets a mean of its target protein ESM-2 vectors.
+            #   This "drug via targets" embedding is concatenated with the
+            #   drug's own embedding before pair feature construction.
+            #
+            # Option 2 (more faithful to KGE):
+            #   Train a full KGE and use the learned entity embeddings.
+            #   This is what the main HPO script does.
+            #
+            # For the ablation, Option 1 is appropriate because we want to
+            # isolate embedding contributions without KGE training confounding.
 
-        # Build dataset
-        print(f"  Building dataset...")
-        X, y, se_labels, degrees = build_dataset(
-            df, drug_emb, drug_to_idx,
-            neg_ratio=args.neg_ratio,
-            seed=args.seed,
-            se_sample=se_sample,
-        )
+            print(f"  Drug embedding: {drug_emb.shape}")
+
+            print(f"  Building dataset...")
+            X, y, se_labels, degrees = build_dataset(
+                df, drug_emb, drug_to_idx,
+                neg_ratio=args.neg_ratio,
+                seed=args.seed,
+                se_sample=se_sample,
+                max_pos_edges=args.max_pos_edges,
+            )
+            del drug_emb
+            gc.collect()
+
+            if args.dataset_cache_dir and cache_npz is not None:
+                meta = {
+                    "condition": condition,
+                    "signature": cache_sig,
+                    "combo": Path(args.combo).name,
+                    "seed": args.seed,
+                    "neg_ratio": args.neg_ratio,
+                    "max_pos_edges": args.max_pos_edges,
+                }
+                save_dataset_npz(cache_npz, X, y, se_labels, degrees, meta)
+                print(f"  Wrote dataset cache → {cache_npz}")
+
+        if len(y) == 0:
+            raise RuntimeError(
+                "No samples after dataset load/build; check --combo, --min_edges, cache, "
+                "and entity coverage."
+            )
+
         print(f"  Samples: {len(y):,} ({y.sum():,} pos, {(1-y).sum():,} neg)")
 
-        # Train/test split — stratified by SE type
-        X_train, X_test, y_train, y_test, se_train, se_test, deg_train, deg_test = \
-            train_test_split(
-                X, y, se_labels, degrees,
-                test_size=args.test_frac,
-                stratify=y,
-                random_state=args.seed,
-            )
+        idx = np.arange(len(y), dtype=np.int64)
+        train_idx, test_idx = train_test_split(
+            idx,
+            test_size=args.test_frac,
+            stratify=y,
+            random_state=args.seed,
+        )
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+        se_train = se_labels[train_idx]
+        se_test = se_labels[test_idx]
+        deg_train = degrees[train_idx]
+        deg_test = degrees[test_idx]
+        del X
+        gc.collect()
 
         for model_name in models_to_run:
             print(f"  Training {model_name}...")
             clf, y_score = train_model(model_name, X_train, y_train, X_test, args.seed)
 
-            # Per-SE evaluation
             results_df = evaluate(
                 y_test, y_score, se_test, deg_test, tier_map,
                 condition=f"{condition}_{model_name}"
             )
-            all_results.append(results_df)
+            per_se_first = append_per_se_results(
+                results_per_se_path, results_df, per_se_first)
 
-            # Feature importance
             save_feature_importance(clf, condition, dim, output_dir, model_name)
 
             overall_auroc = roc_auc_score(y_test, y_score)
             overall_auprc = average_precision_score(y_test, y_score)
 
-            # Quick summary
             print(f"  {model_name} — overall AUROC: "
                   f"{overall_auroc:.4f}  "
                   f"AUPRC: {overall_auprc:.4f}")
@@ -659,9 +837,14 @@ def main():
                 wandb.log(log_payload, step=wandb_step)
                 wandb_step += 1
 
+            del clf, y_score
+            gc.collect()
+
+        del X_train, X_test, y_train, y_test, se_train, se_test, deg_train, deg_test
+        gc.collect()
+
     # ── Aggregate results ──────────────────────────────────────────────────
-    all_df = pd.concat(all_results, ignore_index=True)
-    all_df.to_csv(output_dir / "ablation_results_per_se.csv", index=False)
+    all_df = pd.read_csv(results_per_se_path)
 
     # Summary: median per condition per tier
     summary = (all_df.groupby(["condition", "tier"])
