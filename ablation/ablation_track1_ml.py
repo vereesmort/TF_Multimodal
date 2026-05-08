@@ -460,6 +460,15 @@ def build_dataset(df: pd.DataFrame,
     dim = emb.shape[1]
     feat_dim = 2 * dim
 
+    # Degree product (bias metric): counts over the FULL combo passed in, before
+    # --n_se_sample filtering. Subsetting SEs only would omit drugs that appear
+    # in other SEs → KeyError when negatives sample those drugs as corrupt endpoints.
+    stacked_all = pd.concat([df["STITCH 1"], df["STITCH 2"]], ignore_index=True)
+    degree = stacked_all.value_counts().to_dict()
+
+    def deg_prod(x, y) -> float:
+        return float(degree.get(x, 1) * degree.get(y, 1))
+
     if se_sample is not None:
         df = df[df["Polypharmacy Side Effect"].isin(se_sample)]
 
@@ -476,9 +485,6 @@ def build_dataset(df: pd.DataFrame,
     if max_pos_edges is not None and len(df) > max_pos_edges:
         df = df.sample(n=max_pos_edges, random_state=seed)
         print(f"  Subsampled positives to --max_pos_edges={max_pos_edges:,}")
-
-    stacked = pd.concat([df["STITCH 1"], df["STITCH 2"]], ignore_index=True)
-    degree = stacked.value_counts().to_dict()
 
     n_pos = len(df)
     n_samples = n_pos * (1 + neg_ratio)
@@ -501,7 +507,7 @@ def build_dataset(df: pd.DataFrame,
         X[row, dim:] = np.abs(ea - eb)
         y[row] = 1
         se_labels[row] = se
-        degrees[row] = np.float32(degree[a] * degree[b])
+        degrees[row] = np.float32(deg_prod(a, b))
         row += 1
 
         for _ in range(neg_ratio):
@@ -511,14 +517,14 @@ def build_dataset(df: pd.DataFrame,
                 ec = emb[ic]
                 X[row, :dim] = ec * eb
                 X[row, dim:] = np.abs(ec - eb)
-                degrees[row] = np.float32(degree[neg_drug] * degree[b])
+                degrees[row] = np.float32(deg_prod(neg_drug, b))
             else:
                 neg_drug = all_drug_ids[rng.randint(n_drugs)]
                 ic = drug_to_idx[neg_drug]
                 ec = emb[ic]
                 X[row, :dim] = ea * ec
                 X[row, dim:] = np.abs(ea - ec)
-                degrees[row] = np.float32(degree[a] * degree[neg_drug])
+                degrees[row] = np.float32(deg_prod(a, neg_drug))
             y[row] = 0
             se_labels[row] = se
             row += 1
