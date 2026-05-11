@@ -26,16 +26,26 @@ For drugs with NO target annotations (361/645 in Decagon):
 
 Output
 ------
-  drug_via_targets_256.pt   — (n_drugs, 256) tensor, ordered by drug_to_idx
-  coverage_report.csv       — per-drug annotation coverage
+  <out_tensor_name>.pt      — (n_drugs, 256) tensor, ordered by drug_to_idx
+  target_coverage_report.csv — per-drug annotation coverage
+  drug_to_idx.json           — drug string → row index used for tensor rows
 
 Usage
 -----
+  # ESM branch (default output name)
   python build_drug_protein_features.py \
     --targets   bio-decagon-targets.csv \
     --combo     bio-decagon-combo.csv \
     --prot_emb  protein_init_dim256_esm2_t30_150M_UR50D.pt \
     --output    ./
+
+  # PPI branch with custom output tensor filename
+  python build_drug_protein_features.py \
+    --targets          bio-decagon-targets.csv \
+    --combo            bio-decagon-combo.csv \
+    --prot_emb         protein_emb_ppi_neighbour_dim256_esm2_t30_150M_UR50D.pt \
+    --out_tensor_name  drug_via_mean_ppi.pt \
+    --output           ./
 """
 
 import argparse
