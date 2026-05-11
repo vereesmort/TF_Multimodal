@@ -45,7 +45,7 @@ Outputs
 
 Usage
 -----
-  # Minimal — tune on a specific SE CUI, conditions A and D only
+  # Minimal (already drug-level protein tensors) — tune on a specific SE CUI
   python hpo_track1_optuna.py \\
     --combo              bio-decagon-combo.csv \\
     --drug_emb_chemberta drug_emb_chemberta_256.pt \\
@@ -54,13 +54,30 @@ Usage
     --n_trials           100 \\
     --output             ./hpo_results
 
-  # Full — tune all five conditions, pick SE from the median-frequency tier
+  # Full (already drug-level protein tensors) — tune all five conditions
   python hpo_track1_optuna.py \\
     --combo              bio-decagon-combo.csv \\
     --drug_emb_chemberta drug_emb_chemberta_256.pt \\
     --drug_emb_mono      drug_emb_mono_256.pt \\
     --prot_emb_esm2      drug_via_targets_256.pt \\
     --prot_emb_ppi       drug_via_targets_ppi_256.pt \\
+    --se_id              C0015230 \\
+    --conditions         A B C D E \\
+    --n_trials           200 \\
+    --cv_folds           5 \\
+    --output             ./hpo_results \\
+    --seed               42
+
+  # Raw protein tensors (n_proteins x D) — script auto-aggregates to drug level
+  # via --targets; pass --prot_gene_idx if row order is not sorted unique Gene IDs
+  python hpo_track1_optuna.py \\
+    --combo              bio-decagon-combo.csv \\
+    --targets            bio-decagon-targets.csv \\
+    --prot_gene_idx      gene_to_row.json \\
+    --drug_emb_chemberta drug_emb_chemberta_256.pt \\
+    --drug_emb_mono      drug_emb_mono_256.pt \\
+    --prot_emb_esm2      protein_emb_esm2_only_dim256.pt \\
+    --prot_emb_ppi       protein_emb_ppi_neighbour_dim256.pt \\
     --se_id              C0015230 \\
     --conditions         A B C D E \\
     --n_trials           200 \\
@@ -116,7 +133,16 @@ def parse_args():
     p.add_argument("--prot_emb_ppi",       default=None,
                    help="(n_drugs, D) drug-via-targets PPI tensor (optional, for condition E)")
     p.add_argument("--targets",            default=None,
-                   help="bio-decagon-targets.csv (only needed if --prot_emb_esm2 is not pre-built)")
+                   help="bio-decagon-targets.csv. Required when --prot_emb_esm2/--prot_emb_ppi "
+                        "are protein-level tensors (n_proteins x D) and must be aggregated "
+                        "to drug level.")
+    p.add_argument("--prot_gene_idx",      default=None,
+                   help="Optional JSON mapping Gene string -> row index in --prot_emb_esm2 / "
+                        "--prot_emb_ppi when those tensors are protein-level (n_proteins x D).")
+    p.add_argument("--target_impute",      default="zero",
+                   choices=["zero", "mean"],
+                   help="How to fill drugs without resolvable targets when converting protein-level "
+                        "tensors to drug-level: zero or global mean.")
 
     # SE selection
     p.add_argument("--se_id",     default=None,
@@ -202,6 +228,76 @@ def assign_tiers(se_counts: pd.Series, n_tiers: int = 5) -> dict:
     for i, (se, _) in enumerate(sorted_ses.items()):
         tier_map[se] = labels[min(i // tier_size, n_tiers - 1)]
     return tier_map
+
+
+def load_targets_table(path: str) -> pd.DataFrame:
+    """Load targets table with required columns STITCH and Gene."""
+    t = pd.read_csv(path)
+    if "STITCH" not in t.columns or "Gene" not in t.columns:
+        raise ValueError(f"{path}: expected columns STITCH and Gene")
+    t = t.copy()
+    t["STITCH"] = t["STITCH"].astype(str)
+    t["Gene"] = t["Gene"].astype(str)
+    return t
+
+
+def resolve_gene_to_row(
+    n_prot_rows: int,
+    targets: pd.DataFrame,
+    prot_gene_idx: str | None,
+) -> dict[str, int]:
+    """Resolve Gene -> embedding-row index."""
+    if prot_gene_idx:
+        with open(prot_gene_idx) as f:
+            raw = json.load(f)
+        return {str(k): int(v) for k, v in raw.items()}
+
+    genes = sorted(targets["Gene"].unique())
+    if len(genes) > n_prot_rows:
+        raise ValueError(
+            f"{len(genes)} unique Genes in targets but embedding has {n_prot_rows} rows. "
+            "Pass --prot_gene_idx with explicit Gene->row mapping."
+        )
+    print("WARNING: assuming protein embedding rows map to sorted unique Gene IDs from targets.")
+    return {g: i for i, g in enumerate(genes)}
+
+
+def compute_drug_via_targets(
+    prot_emb: torch.Tensor,
+    targets: pd.DataFrame,
+    drug_to_idx: dict[str, int],
+    gene_to_row: dict[str, int],
+    impute: str,
+) -> torch.Tensor:
+    """Aggregate protein embeddings to drug-level by averaging target proteins."""
+    dim = prot_emb.shape[1]
+    n_drugs = len(drug_to_idx)
+    drug_targets: dict[str, list[str]] = defaultdict(list)
+    for _, row in targets.iterrows():
+        drug_targets[row["STITCH"]].append(row["Gene"])
+
+    if impute == "zero":
+        fallback = torch.zeros(dim, dtype=prot_emb.dtype, device=prot_emb.device)
+    else:
+        fallback = prot_emb.mean(dim=0)
+
+    out = torch.zeros(n_drugs, dim, dtype=prot_emb.dtype, device=prot_emb.device)
+    for drug, idx in drug_to_idx.items():
+        genes = drug_targets.get(drug, [])
+        ok = [g for g in genes if g in gene_to_row]
+        if ok:
+            rows = []
+            for g in ok:
+                r = gene_to_row[g]
+                if r < 0 or r >= prot_emb.shape[0]:
+                    raise IndexError(
+                        f"Gene {g} maps to row {r}; embedding shape is {tuple(prot_emb.shape)}"
+                    )
+                rows.append(r)
+            out[idx] = prot_emb[rows].mean(dim=0)
+        else:
+            out[idx] = fallback
+    return out
 
 
 # ── Embedding construction (mirrors ablation_track1_ml.py exactly) ───────────
@@ -600,6 +696,34 @@ def main():
 
     drug_to_idx = make_drug_to_idx(df_full)
     n_drugs  = len(drug_to_idx)
+    # If protein tensors are protein-level (n_proteins x D), convert to drug-level
+    # (n_drugs x D) via targets, matching ablation_track1_ml expectations.
+    need_conversion = (
+        (via_esm is not None and via_esm.shape[0] != n_drugs)
+        or (via_ppi is not None and via_ppi.shape[0] != n_drugs)
+    )
+    if need_conversion:
+        if not args.targets:
+            raise ValueError(
+                "Received protein-level embeddings (rows != n_drugs). "
+                "Provide --targets to aggregate protein->drug (drug-via-targets), "
+                "or pass pre-aggregated drug-level tensors."
+            )
+        targets_df = load_targets_table(args.targets)
+        base_rows = via_esm.shape[0] if via_esm is not None else via_ppi.shape[0]
+        gene_to_row = resolve_gene_to_row(base_rows, targets_df, args.prot_gene_idx)
+
+        if via_esm is not None and via_esm.shape[0] != n_drugs:
+            via_esm = compute_drug_via_targets(
+                via_esm, targets_df, drug_to_idx, gene_to_row, args.target_impute
+            )
+            print(f"  Converted --prot_emb_esm2 to drug-level via targets: {tuple(via_esm.shape)}")
+        if via_ppi is not None and via_ppi.shape[0] != n_drugs:
+            via_ppi = compute_drug_via_targets(
+                via_ppi, targets_df, drug_to_idx, gene_to_row, args.target_impute
+            )
+            print(f"  Converted --prot_emb_ppi to drug-level via targets: {tuple(via_ppi.shape)}")
+
     drug_dim = chemberta.shape[1] if chemberta is not None else (via_esm.shape[1] if via_esm is not None else 256)
     prot_dim = via_esm.shape[1]   if via_esm   is not None else drug_dim
 
