@@ -56,6 +56,8 @@ def parse_args():
                    help="JSON mapping gene_id_str → row index in prot_emb. "
                         "If None, assumes rows are ordered by sorted gene ID.")
     p.add_argument("--output",    default="./")
+    p.add_argument("--out_tensor_name", default="drug_via_targets_256.pt",
+                   help="Output filename for drug-level tensor (e.g. drug_via_mean_ppi.pt)")
     p.add_argument("--impute",    default="zero",
                    choices=["zero", "mean"],
                    help="How to handle drugs with no target annotations")
@@ -141,7 +143,7 @@ def main():
     print(f"Drugs using {args.impute} imputation: {n_drugs - n_covered}")
 
     # ── Save ───────────────────────────────────────────────────────────────
-    out_tensor = output_dir / "drug_via_targets_256.pt"
+    out_tensor = output_dir / args.out_tensor_name
     out_cov    = output_dir / "target_coverage_report.csv"
     out_idx    = output_dir / "drug_to_idx.json"
 
@@ -154,8 +156,8 @@ def main():
     print(f"  {out_tensor}  — shape {drug_via_targets.shape}")
     print(f"  {out_cov}")
     print(f"  {out_idx}")
-    print("\nUse drug_via_targets_256.pt as --prot_emb_esm2 in ablation_track1_ml.py")
-    print("when testing conditions B and E.")
+    print(f"\nUse {args.out_tensor_name} as --prot_emb_esm2 or --prot_emb_ppi in")
+    print("ablation_track1_ml.py / hpo_track1_optuna.py depending on branch.")
 
 
 if __name__ == "__main__":
