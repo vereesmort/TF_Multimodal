@@ -100,6 +100,11 @@ Usage
   Batched SEs (resume without max_pos_edges): SEs are ordered by decreasing
   edge count. Run batch 0: ``--n_se_sample 100 --se_offset 0``; batch 1:
   ``--n_se_sample 100 --se_offset 100 --append_se_results`` (same ``--output``).
+
+  ``--append_se_results``: when ``ablation_results_per_se.csv`` already exists
+  under ``--output``, append new rows (no duplicate header). Omit on batch 0;
+  add on batch 1, 2, … so later runs do not overwrite earlier SE batches.
+  ``ablation_summary.csv`` is recomputed at the end of each run from the full CSV.
 """
 
 import argparse
@@ -142,6 +147,15 @@ def parse_args():
     p.add_argument("--target_impute",      default="zero",
                    choices=["zero", "mean"],
                    help="Drugs with no resolvable targets: zero vector or global mean protein embedding.")
+    p.add_argument("--pair_repr",          default="sym",
+                   choices=["sym", "concat"],
+                   help="Pair representation: "
+                        "'sym' = [e_A * e_B || |e_A - e_B|] (order-invariant), "
+                        "'concat' = [e_A || e_B] with canonical STITCH ordering.")
+    p.add_argument("--drug_fusion",        default="hstack",
+                   choices=["hstack"],
+                   help="How to combine drug/protein branches per drug. "
+                        "Currently only 'hstack' = torch.cat([drug_branch, prot_branch], dim=1).")
     p.add_argument("--output",             default="./ablation_results")
     p.add_argument("--seed",               type=int,  default=42)
     p.add_argument("--neg_ratio",          type=int,  default=1,
@@ -158,8 +172,9 @@ def parse_args():
                    help="Skip the first N side effects in the canonical frequency-sorted list "
                         "(used with --n_se_sample for batched / resume runs).")
     p.add_argument("--append_se_results", action="store_true",
-                   help="If ablation_results_per_se.csv already exists under --output, append "
-                        "new rows instead of overwriting (for merging SE batches).")
+                   help="If ablation_results_per_se.csv exists under --output, append rows "
+                        "(no header). Use from batch 2 onward when merging --n_se_sample windows "
+                        "(--se_offset 100, 200, …); omit on first batch or the file is truncated.")
     p.add_argument("--max_pos_edges",      type=int,  default=None,
                    help="Cap positive edges after filtering (random subsample, seed-controlled). "
                         "Cuts RAM ~linearly in this cap.")
@@ -300,6 +315,7 @@ def build_fused_drug_embedding_matrix(
     n_drugs: int,
     drug_dim: int,
     prot_dim: int,
+    drug_fusion: str,
     seed: int,
     chemberta: torch.Tensor | None,
     mono: torch.Tensor | None,
@@ -312,6 +328,9 @@ def build_fused_drug_embedding_matrix(
     Shapes: ``(n_drugs, drug_dim + prot_dim)``. Drug width ``drug_dim`` comes from
     ChemBERTa (and mono for E); protein width ``prot_dim`` from ``--prot_emb_esm2``.
     """
+    if drug_fusion != "hstack":
+        raise ValueError(f"Unsupported --drug_fusion {drug_fusion!r}; use 'hstack'.")
+
     drug_branch = build_drug_embeddings(
         condition, n_drugs, chemberta, mono, drug_dim, seed)
 
@@ -413,7 +432,7 @@ def build_protein_embeddings(condition: str,
 
 # ── Feature construction ───────────────────────────────────────────────────────
 
-def pair_features(e_a: np.ndarray, e_b: np.ndarray) -> np.ndarray:
+def pair_features(e_a: np.ndarray, e_b: np.ndarray, pair_repr: str = "sym") -> np.ndarray:
     """
     Construct symmetric feature vector for a drug pair.
 
@@ -426,7 +445,11 @@ def pair_features(e_a: np.ndarray, e_b: np.ndarray) -> np.ndarray:
       - Sensitive to dissimilarity (diff term)
       - 2×dim features total
     """
-    return np.concatenate([e_a * e_b, np.abs(e_a - e_b)], axis=-1)
+    if pair_repr == "sym":
+        return np.concatenate([e_a * e_b, np.abs(e_a - e_b)], axis=-1)
+    if pair_repr == "concat":
+        return np.concatenate([e_a, e_b], axis=-1)
+    raise ValueError(f"Unknown pair_repr: {pair_repr}")
 
 
 def build_dataset(df: pd.DataFrame,
@@ -435,7 +458,8 @@ def build_dataset(df: pd.DataFrame,
                   neg_ratio: int,
                   seed: int,
                   se_sample: list | None = None,
-                  max_pos_edges: int | None = None):
+                  max_pos_edges: int | None = None,
+                  pair_repr: str = "sym"):
     """
     Build (X, y, se_labels) arrays for binary classification.
 
@@ -458,6 +482,8 @@ def build_dataset(df: pd.DataFrame,
     emb = np.ascontiguousarray(
         drug_emb.detach().cpu().numpy(), dtype=np.float32)
     dim = emb.shape[1]
+    if pair_repr not in {"sym", "concat"}:
+        raise ValueError(f"Unknown pair_repr: {pair_repr}")
     feat_dim = 2 * dim
 
     # Degree product (bias metric): counts over the FULL combo passed in, before
@@ -468,6 +494,22 @@ def build_dataset(df: pd.DataFrame,
 
     def deg_prod(x, y) -> float:
         return float(degree.get(x, 1) * degree.get(y, 1))
+
+    def write_concat_pair(row_idx: int,
+                          left_id: str,
+                          left_vec: np.ndarray,
+                          right_id: str,
+                          right_vec: np.ndarray) -> None:
+        """
+        Canonicalize undirected pairs for concat: lower STITCH id goes first.
+        Prevents direction leakage from arbitrary input order.
+        """
+        if left_id <= right_id:
+            X[row_idx, :dim] = left_vec
+            X[row_idx, dim:] = right_vec
+        else:
+            X[row_idx, :dim] = right_vec
+            X[row_idx, dim:] = left_vec
 
     if se_sample is not None:
         df = df[df["Polypharmacy Side Effect"].isin(se_sample)]
@@ -503,8 +545,11 @@ def build_dataset(df: pd.DataFrame,
         a, b, se = s1[i], s2[i], se_col[i]
         ia, ib = drug_to_idx[a], drug_to_idx[b]
         ea, eb = emb[ia], emb[ib]
-        X[row, :dim] = ea * eb
-        X[row, dim:] = np.abs(ea - eb)
+        if pair_repr == "sym":
+            X[row, :dim] = ea * eb
+            X[row, dim:] = np.abs(ea - eb)
+        else:  # pair_repr == "concat"
+            write_concat_pair(row, a, ea, b, eb)
         y[row] = 1
         se_labels[row] = se
         degrees[row] = np.float32(deg_prod(a, b))
@@ -515,15 +560,21 @@ def build_dataset(df: pd.DataFrame,
                 neg_drug = all_drug_ids[rng.randint(n_drugs)]
                 ic = drug_to_idx[neg_drug]
                 ec = emb[ic]
-                X[row, :dim] = ec * eb
-                X[row, dim:] = np.abs(ec - eb)
+                if pair_repr == "sym":
+                    X[row, :dim] = ec * eb
+                    X[row, dim:] = np.abs(ec - eb)
+                else:  # pair_repr == "concat"
+                    write_concat_pair(row, neg_drug, ec, b, eb)
                 degrees[row] = np.float32(deg_prod(neg_drug, b))
             else:
                 neg_drug = all_drug_ids[rng.randint(n_drugs)]
                 ic = drug_to_idx[neg_drug]
                 ec = emb[ic]
-                X[row, :dim] = ea * ec
-                X[row, dim:] = np.abs(ea - ec)
+                if pair_repr == "sym":
+                    X[row, :dim] = ea * ec
+                    X[row, dim:] = np.abs(ea - ec)
+                else:  # pair_repr == "concat"
+                    write_concat_pair(row, a, ea, neg_drug, ec)
                 degrees[row] = np.float32(deg_prod(a, neg_drug))
             y[row] = 0
             se_labels[row] = se
@@ -546,6 +597,8 @@ def _dataset_cache_signature(args: argparse.Namespace,
         "targets": Path(args.targets).name if args.targets else None,
         "target_impute": args.target_impute,
         "prot_gene_idx": Path(args.prot_gene_idx).name if args.prot_gene_idx else None,
+        "pair_repr": args.pair_repr,
+        "drug_fusion": args.drug_fusion,
         "fusion": "hstack_drug_prot",
     }
     blob = json.dumps(meta, sort_keys=True).encode()
@@ -804,33 +857,53 @@ def main():
                      else [args.model])
 
     need_targets = bool(set(conditions) & {"A", "B", "E"})
-    if need_targets and not args.targets:
-        raise ValueError(
-            "Conditions A, B, or E require --targets (e.g. bio-decagon-targets.csv) "
-            "to build drug→target→mean(protein embedding) vectors."
-        )
-
     via_esm = None
     via_ppi = None
+    targets_df = None
+
     if need_targets:
-        targets_df = load_targets_table(args.targets)
-        gene_to_row = resolve_gene_to_row(esm2.shape[0], targets_df, args.prot_gene_idx)
-        via_esm = compute_drug_via_targets(
-            esm2, targets_df, drug_to_idx, gene_to_row, args.target_impute
-        )
-        print(f"  drug-via-ESM (mean over targets): {tuple(via_esm.shape)}")
+        # Support both:
+        #  1) pre-aggregated drug-level tensors: (n_drugs, D)
+        #  2) protein-level tensors:            (n_proteins, D) + --targets mapping
+        if esm2.shape[0] == n_drugs:
+            via_esm = esm2[:n_drugs]
+            print(f"  Using pre-aggregated drug-level --prot_emb_esm2: {tuple(via_esm.shape)}")
+        else:
+            if not args.targets:
+                raise ValueError(
+                    "--prot_emb_esm2 appears protein-level (rows != n_drugs). "
+                    "Provide --targets to aggregate protein→drug, or pass a pre-aggregated "
+                    "drug-level tensor."
+                )
+            targets_df = load_targets_table(args.targets)
+            gene_to_row = resolve_gene_to_row(esm2.shape[0], targets_df, args.prot_gene_idx)
+            via_esm = compute_drug_via_targets(
+                esm2, targets_df, drug_to_idx, gene_to_row, args.target_impute
+            )
+            print(f"  drug-via-ESM (mean over targets): {tuple(via_esm.shape)}")
+
         if "E" in conditions:
             if ppi is None:
                 raise ValueError("Condition E requires --prot_emb_ppi.")
-            if ppi.shape[0] != esm2.shape[0]:
-                raise ValueError(
-                    "For condition E, --prot_emb_ppi must have the same number of rows as "
-                    "--prot_emb_esm2 when using one --prot_gene_idx mapping."
+            if ppi.shape[0] == n_drugs:
+                via_ppi = ppi[:n_drugs]
+                print(f"  Using pre-aggregated drug-level --prot_emb_ppi: {tuple(via_ppi.shape)}")
+            else:
+                if targets_df is None:
+                    if not args.targets:
+                        raise ValueError(
+                            "--prot_emb_ppi appears protein-level (rows != n_drugs). "
+                            "Provide --targets to aggregate protein→drug, or pass a "
+                            "pre-aggregated drug-level tensor."
+                        )
+                    targets_df = load_targets_table(args.targets)
+                gene_to_row_ppi = resolve_gene_to_row(
+                    ppi.shape[0], targets_df, args.prot_gene_idx
                 )
-            via_ppi = compute_drug_via_targets(
-                ppi, targets_df, drug_to_idx, gene_to_row, args.target_impute
-            )
-            print(f"  drug-via-PPI (mean over targets): {tuple(via_ppi.shape)}")
+                via_ppi = compute_drug_via_targets(
+                    ppi, targets_df, drug_to_idx, gene_to_row_ppi, args.target_impute
+                )
+                print(f"  drug-via-PPI (mean over targets): {tuple(via_ppi.shape)}")
 
     wandb_run = None
     if args.wandb:
@@ -867,6 +940,8 @@ def main():
                 "reuse_dataset_cache": args.reuse_dataset_cache,
                 "targets": args.targets,
                 "target_impute": args.target_impute,
+                "pair_repr": args.pair_repr,
+                "drug_fusion": args.drug_fusion,
                 "embedding_dim": fused_dim,
                 "drug_dim": drug_dim,
                 "prot_dim": prot_dim,
@@ -904,11 +979,11 @@ def main():
             print(f"  Dataset: loaded cache {cache_npz.name} (skipping drug_emb + build_dataset)")
         else:
             drug_emb = build_fused_drug_embedding_matrix(
-                condition, n_drugs, drug_dim, prot_dim, args.seed,
+                condition, n_drugs, drug_dim, prot_dim, args.drug_fusion, args.seed,
                 chemberta, mono, via_esm, via_ppi,
             )
 
-            print(f"  Fused per-drug embedding (hstack): {drug_emb.shape}")
+            print(f"  Fused per-drug embedding ({args.drug_fusion}): {drug_emb.shape}")
 
             print(f"  Building dataset...")
             X, y, se_labels, degrees = build_dataset(
@@ -917,6 +992,7 @@ def main():
                 seed=args.seed,
                 se_sample=se_sample,
                 max_pos_edges=args.max_pos_edges,
+                pair_repr=args.pair_repr,
             )
             del drug_emb
             gc.collect()
