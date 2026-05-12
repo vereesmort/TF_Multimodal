@@ -33,6 +33,7 @@ PPI) from ``bio-decagon-targets.csv`` (drug→gene→embedding row). The ``+`` i
 older docs meant element-wise sum; the default now is **hstack** (``torch.cat``).
 
 Combination strategies:
+  - sum:    [e_A + e_B]                  (dim, order-invariant)
   - concatenate:   [e_A || e_B]                  (2×dim features)
   - elementwise:   [e_A * e_B]                   (dim features, like DistMult)
   - absolute diff: [|e_A - e_B|]                 (dim features, symmetric)
@@ -41,6 +42,10 @@ Combination strategies:
 We use elementwise product + absolute difference as default — this is the
 standard approach in KGE-to-classifier transfer (Nickel et al., Hamilton et al.)
 and is invariant to drug ordering (symmetric), which is correct for PSE.
+`sym` follows a common KGE-to-classifier transfer pattern (Nickel et al.,
+Hamilton et al.). `concat` keeps branch-wise identity information; `sum` is a
+compact symmetric baseline.
+
 
 Negative sampling
 -----------------
@@ -69,6 +74,9 @@ Output
 
 Usage
 -----
+  # Protein tensors can be either:
+  #   (a) protein-level (n_proteins, D) -> pass --targets for aggregation
+  #   (b) pre-aggregated drug-level (n_drugs, D) -> --targets optional
   python ablation_track1_ml.py \\
     --combo    bio-decagon-combo.csv \\
     --targets  bio-decagon-targets.csv \\
@@ -88,6 +96,13 @@ Usage
     --targets  bio-decagon-targets.csv \\
     --drug_emb_chemberta  data/cache/ablation/drug_emb_chemberta_256.pt \\
     --prot_emb_esm2       data/cache/ablation/protein_emb_esm2_only_dim256_esm2_t30_150M_UR50D.pt \\
+    --output   ./ablation_results
+
+  Same run but using pre-aggregated drug-level protein tensors:
+  python ablation_track1_ml.py \\
+    --combo    bio-decagon-combo.csv \\
+    --drug_emb_chemberta  data/cache/ablation/drug_emb_chemberta_256.pt \\
+    --prot_emb_esm2       data/cache/ablation/drug_via_mean_esm2.pt \\
     --output   ./ablation_results
 
   With Weights & Biases (requires `pip install wandb` and `wandb login`):
@@ -148,10 +163,11 @@ def parse_args():
                    choices=["zero", "mean"],
                    help="Drugs with no resolvable targets: zero vector or global mean protein embedding.")
     p.add_argument("--pair_repr",          default="sym",
-                   choices=["sym", "concat"],
+                   choices=["sym", "concat", "sum"],
                    help="Pair representation: "
                         "'sym' = [e_A * e_B || |e_A - e_B|] (order-invariant), "
-                        "'concat' = [e_A || e_B] with canonical STITCH ordering.")
+                        "'concat' = [e_A || e_B] with canonical STITCH ordering, "
+                        "'sum' = [e_A + e_B] (order-invariant).")
     p.add_argument("--drug_fusion",        default="hstack",
                    choices=["hstack"],
                    help="How to combine drug/protein branches per drug. "
@@ -449,6 +465,8 @@ def pair_features(e_a: np.ndarray, e_b: np.ndarray, pair_repr: str = "sym") -> n
         return np.concatenate([e_a * e_b, np.abs(e_a - e_b)], axis=-1)
     if pair_repr == "concat":
         return np.concatenate([e_a, e_b], axis=-1)
+    if pair_repr == "sum":
+        return e_a + e_b
     raise ValueError(f"Unknown pair_repr: {pair_repr}")
 
 
@@ -482,9 +500,9 @@ def build_dataset(df: pd.DataFrame,
     emb = np.ascontiguousarray(
         drug_emb.detach().cpu().numpy(), dtype=np.float32)
     dim = emb.shape[1]
-    if pair_repr not in {"sym", "concat"}:
+    if pair_repr not in {"sym", "concat", "sum"}:
         raise ValueError(f"Unknown pair_repr: {pair_repr}")
-    feat_dim = 2 * dim
+    feat_dim = dim if pair_repr == "sum" else 2 * dim
 
     # Degree product (bias metric): counts over the FULL combo passed in, before
     # --n_se_sample filtering. Subsetting SEs only would omit drugs that appear
@@ -548,8 +566,10 @@ def build_dataset(df: pd.DataFrame,
         if pair_repr == "sym":
             X[row, :dim] = ea * eb
             X[row, dim:] = np.abs(ea - eb)
-        else:  # pair_repr == "concat"
+        elif pair_repr == "concat":
             write_concat_pair(row, a, ea, b, eb)
+        else:  # pair_repr == "sum"
+            X[row, :] = ea + eb
         y[row] = 1
         se_labels[row] = se
         degrees[row] = np.float32(deg_prod(a, b))
@@ -563,8 +583,10 @@ def build_dataset(df: pd.DataFrame,
                 if pair_repr == "sym":
                     X[row, :dim] = ec * eb
                     X[row, dim:] = np.abs(ec - eb)
-                else:  # pair_repr == "concat"
+                elif pair_repr == "concat":
                     write_concat_pair(row, neg_drug, ec, b, eb)
+                else:  # pair_repr == "sum"
+                    X[row, :] = ec + eb
                 degrees[row] = np.float32(deg_prod(neg_drug, b))
             else:
                 neg_drug = all_drug_ids[rng.randint(n_drugs)]
@@ -573,8 +595,10 @@ def build_dataset(df: pd.DataFrame,
                 if pair_repr == "sym":
                     X[row, :dim] = ea * ec
                     X[row, dim:] = np.abs(ea - ec)
-                else:  # pair_repr == "concat"
+                elif pair_repr == "concat":
                     write_concat_pair(row, a, ea, neg_drug, ec)
+                else:  # pair_repr == "sum"
+                    X[row, :] = ea + ec
                 degrees[row] = np.float32(deg_prod(a, neg_drug))
             y[row] = 0
             se_labels[row] = se
@@ -753,16 +777,14 @@ def train_model(model_name: str, X_train, y_train, X_test, seed: int):
 # ── Feature importance ────────────────────────────────────────────────────────
 
 def save_feature_importance(clf, condition: str, dim: int, output_dir: Path,
-                             model_name: str):
+                             model_name: str, pair_repr: str):
     """
     Save feature importance for a trained XGBoost/CatBoost model.
 
-    Feature names:
-      0..dim-1        : elementwise product dims (DistMult-like signal)
-      dim..2*dim-1    : absolute difference dims  (dissimilarity signal)
-
-    Aggregate importance by group (product vs diff) to see which
-    combination type the model relies on more.
+    Aggregate importance by pair representation:
+      sym    -> product vs absolute_difference
+      concat -> first_drug_slot vs second_drug_slot
+      sum    -> summed_pair_features
     """
     fi_dir = output_dir / "feature_importance"
     fi_dir.mkdir(exist_ok=True)
@@ -773,15 +795,29 @@ def save_feature_importance(clf, condition: str, dim: int, output_dir: Path,
         else:
             imp = clf.get_feature_importance()
 
-        product_imp = imp[:dim].sum()
-        diff_imp    = imp[dim:].sum()
-        total       = product_imp + diff_imp
+        groups = []
+        if pair_repr == "sym":
+            groups = [
+                ("elementwise_product (e_A * e_B)", imp[:dim].sum()),
+                ("absolute_difference (|e_A - e_B|)", imp[dim:].sum()),
+            ]
+        elif pair_repr == "concat":
+            groups = [
+                ("first_drug_slot", imp[:dim].sum()),
+                ("second_drug_slot", imp[dim:].sum()),
+            ]
+        elif pair_repr == "sum":
+            groups = [("summed_pair_features (e_A + e_B)", imp.sum())]
+        else:
+            groups = [("all_features", imp.sum())]
 
+        total = sum(v for _, v in groups)
+        if total <= 0:
+            total = 1.0
         summary = pd.DataFrame({
-            "feature_group": ["elementwise_product (e_A * e_B)",
-                               "absolute_difference (|e_A - e_B|)"],
-            "total_importance": [product_imp, diff_imp],
-            "fraction": [product_imp / total, diff_imp / total],
+            "feature_group": [g for g, _ in groups],
+            "total_importance": [v for _, v in groups],
+            "fraction": [v / total for _, v in groups],
         })
         summary.to_csv(fi_dir / f"importance_{condition}_{model_name}.csv", index=False)
         print(f"  Feature importance saved for condition {condition}")
@@ -1046,7 +1082,9 @@ def main():
             per_se_first = append_per_se_results(
                 results_per_se_path, results_df, per_se_first)
 
-            save_feature_importance(clf, condition, fused_dim, output_dir, model_name)
+            save_feature_importance(
+                clf, condition, fused_dim, output_dir, model_name, args.pair_repr
+            )
 
             overall_auroc = roc_auc_score(y_test, y_score)
             overall_auprc = average_precision_score(y_test, y_score)
