@@ -168,6 +168,9 @@ def parse_args():
     p.add_argument("--metric",     default="auroc",
                    choices=["auroc", "auprc"],
                    help="Metric to optimise (default auroc).")
+    p.add_argument("--xgb_params_json", default=None,
+                   help="Optional JSON file with XGBoost params to use as baseline defaults "
+                        "and enqueue as an initial Optuna trial (if not resuming).")
     p.add_argument("--tune_neg_ratio", action="store_true",
                    help="Also search over neg_ratio (1–5). Rebuilds the dataset inside each trial "
                         "— slower but important if you suspect class balance matters.")
@@ -633,6 +636,14 @@ def save_report(output_dir: Path, condition: str, se_id: str, study,
     return report_path
 
 
+def _load_xgb_params_json(path: str) -> dict:
+    with open(path) as f:
+        params = json.load(f)
+    if not isinstance(params, dict):
+        raise ValueError(f"--xgb_params_json {path} must contain a JSON object.")
+    return params
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -741,6 +752,24 @@ def main():
         "scale_pos_weight": 1.0,
         "neg_ratio"       : args.neg_ratio,
     }
+    enqueue_baseline = None
+    if args.xgb_params_json:
+        loaded = _load_xgb_params_json(args.xgb_params_json)
+        allowed = set(DEFAULT_PARAMS.keys())
+        unknown = sorted([k for k in loaded.keys() if k not in allowed])
+        if unknown:
+            print(f"WARNING: ignoring unknown keys in --xgb_params_json: {unknown}")
+        filtered = {k: loaded[k] for k in loaded.keys() if k in allowed}
+        DEFAULT_PARAMS.update(filtered)
+        enqueue_baseline = {
+            k: v for k, v in filtered.items()
+            if k in {
+                "n_estimators", "max_depth", "learning_rate", "subsample",
+                "colsample_bytree", "min_child_weight", "gamma",
+                "reg_alpha", "reg_lambda", "scale_pos_weight", "neg_ratio",
+            }
+        }
+        print(f"Loaded baseline params from --xgb_params_json: {args.xgb_params_json}")
 
     all_best = {}  # condition → best_params
 
@@ -823,6 +852,17 @@ def main():
                     interval_steps=1,
                 ),
             )
+            if enqueue_baseline:
+                # Ensure enqueued params fit current tuning mode:
+                # - if tune_neg_ratio=False, remove it from enqueued trial
+                # - if tune_neg_ratio=True and absent, use CLI --neg_ratio baseline
+                baseline_trial = enqueue_baseline.copy()
+                if args.tune_neg_ratio:
+                    baseline_trial.setdefault("neg_ratio", args.neg_ratio)
+                else:
+                    baseline_trial.pop("neg_ratio", None)
+                study.enqueue_trial(baseline_trial)
+                print("  Enqueued baseline trial from --xgb_params_json.")
 
         objective_fn = make_objective(
             X_train=X_train,
