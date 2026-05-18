@@ -120,6 +120,10 @@ Usage
   under ``--output``, append new rows (no duplicate header). Omit on batch 0;
   add on batch 1, 2, … so later runs do not overwrite earlier SE batches.
   ``ablation_summary.csv`` is recomputed at the end of each run from the full CSV.
+
+  Explicit SE CUIs only (no batch window): ``--only_se_ids`` accepts a
+  comma-separated list or a path to a text/csv file (one code per line, optional
+  first column before ``','``).
 """
 
 import argparse
@@ -140,6 +144,24 @@ warnings.filterwarnings("ignore")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_only_se_ids(arg: str) -> list[str]:
+    """
+    Comma-separated CUI tokens, or a path to a file with one ID per line
+    (# and blank lines skipped; csv lines use first comma-separated column).
+    """
+    path = Path(arg)
+    if path.is_file():
+        out: list[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            out.append(line.split(",", 1)[0].strip())
+        return [x for x in out if x]
+    tokens = arg.replace(",", " ").split()
+    return [t for t in tokens if t]
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -187,6 +209,13 @@ def parse_args():
     p.add_argument("--se_offset",          type=int,  default=0,
                    help="Skip the first N side effects in the canonical frequency-sorted list "
                         "(used with --n_se_sample for batched / resume runs).")
+    p.add_argument(
+        "--only_se_ids",
+        default=None,
+        help="Comma- or whitespace-separated CUIs (e.g. C0000737 C0015672), or path to a "
+             "txt/csv file with one CUI per line. Runs only matching SEs (must still pass "
+             "--min_edges in combo). Exclusive with --n_se_sample and non-zero --se_offset.",
+    )
     p.add_argument("--append_se_results", action="store_true",
                    help="If ablation_results_per_se.csv exists under --output, append rows "
                         "(no header). Use from batch 2 onward when merging --n_se_sample windows "
@@ -862,7 +891,33 @@ def main():
     ordered_se = se_counts.sort_values(ascending=False).index.tolist()
     n_se_total = len(ordered_se)
     se_sample = None
-    if args.n_se_sample is not None:
+    if args.only_se_ids and args.n_se_sample is not None:
+        raise ValueError("Cannot use --only_se_ids together with --n_se_sample")
+    if args.only_se_ids and args.se_offset != 0:
+        raise ValueError("Cannot use --only_se_ids together with non-zero --se_offset")
+    if args.only_se_ids:
+        requested = parse_only_se_ids(args.only_se_ids)
+        if not requested:
+            raise ValueError("--only_se_ids resolved to an empty ID list.")
+        unseen = sorted(set(requested) - set(ordered_se))
+        if unseen:
+            print(
+                "Note: CUIs absent from combo after --min_edges filter "
+                f"(skipped, n={len(unseen)}): {unseen[:30]}"
+                + (" ..." if len(unseen) > 30 else "")
+            )
+        want = set(requested)
+        se_sample = [se for se in ordered_se if se in want]
+        if not se_sample:
+            raise RuntimeError(
+                "None of the --only_se_ids CUIs overlap side effects retained after "
+                f"--min_edges={args.min_edges}. Check codes or lower --min_edges."
+            )
+        print(
+            f"Running --only_se_ids subset: {len(se_sample)} of {len(set(requested))} "
+            f"requested (canonical frequency order)"
+        )
+    elif args.n_se_sample is not None:
         start = max(0, args.se_offset)
         end = min(start + args.n_se_sample, n_se_total)
         if start >= n_se_total:
@@ -969,6 +1024,7 @@ def main():
                 "model_policy": args.model,
                 "min_edges": args.min_edges,
                 "n_se_sample": args.n_se_sample,
+                "only_se_ids": args.only_se_ids,
                 "se_offset": args.se_offset,
                 "append_se_results": args.append_se_results,
                 "max_pos_edges": args.max_pos_edges,
