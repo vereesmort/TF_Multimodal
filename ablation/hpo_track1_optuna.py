@@ -23,16 +23,16 @@ Search space
 ------------
 Parameter          Type      Range / Choices
 -----------        ----      ---------------
-n_estimators       int       100 – 1000  (step 50)
-max_depth          int       3 – 10
-learning_rate      float     0.005 – 0.3  (log scale)
-subsample          float     0.5 – 1.0
-colsample_bytree   float     0.4 – 1.0
-min_child_weight   int       1 – 20
-gamma              float     0.0 – 5.0
-reg_alpha          float     1e-8 – 10.0 (log scale)  L1
-reg_lambda         float     1e-8 – 10.0 (log scale)  L2
-scale_pos_weight   float     0.5 – 5.0   (class imbalance; 1.0 = balanced)
+n_estimators       int       100 – 800   (step 50)
+max_depth          int       3 – 8
+learning_rate      float     0.01 – 0.3  (log scale)
+subsample          float     0.6 – 1.0
+colsample_bytree   float     0.5 – 1.0
+min_child_weight   int       1 – 10
+gamma              float     0.0 – 1.0   (was 5.0; >1 almost always harmful)
+reg_alpha          float     1e-6 – 1.0  (log scale)  L1  (was 10.0)
+reg_lambda         float     1e-6 – 1.0  (log scale)  L2  (was 10.0)
+scale_pos_weight   float     0.8 – 1.5   (was 0.5–5.0; balanced data needs ~1.0)
 neg_ratio          int       1 – 5       (negatives per positive, dataset-level)
 
 Outputs
@@ -501,16 +501,16 @@ def make_objective(
     def objective(trial):
         # ── Hyperparameter suggestions ────────────────────────────────────
         params = {
-            "n_estimators"     : trial.suggest_int("n_estimators", 100, 1000, step=50),
-            "max_depth"        : trial.suggest_int("max_depth", 3, 10),
-            "learning_rate"    : trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
-            "subsample"        : trial.suggest_float("subsample", 0.5, 1.0),
-            "colsample_bytree" : trial.suggest_float("colsample_bytree", 0.4, 1.0),
-            "min_child_weight" : trial.suggest_int("min_child_weight", 1, 20),
-            "gamma"            : trial.suggest_float("gamma", 0.0, 5.0),
-            "reg_alpha"        : trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-            "reg_lambda"       : trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-            "scale_pos_weight" : trial.suggest_float("scale_pos_weight", 0.5, 5.0),
+            "n_estimators"     : trial.suggest_int("n_estimators", 100, 800, step=50),
+            "max_depth"        : trial.suggest_int("max_depth", 3, 8),
+            "learning_rate"    : trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample"        : trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree" : trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight" : trial.suggest_int("min_child_weight", 1, 10),
+            "gamma"            : trial.suggest_float("gamma", 0.0, 1.0),
+            "reg_alpha"        : trial.suggest_float("reg_alpha", 1e-6, 1.0, log=True),
+            "reg_lambda"       : trial.suggest_float("reg_lambda", 1e-6, 1.0, log=True),
+            "scale_pos_weight" : trial.suggest_float("scale_pos_weight", 0.8, 1.5),
         }
 
         # ── Optionally tune neg_ratio (rebuilds dataset) ──────────────────
