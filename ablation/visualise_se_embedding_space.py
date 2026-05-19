@@ -162,7 +162,11 @@ def parse_args():
     p.add_argument("--se_t5", default=None,
                    help="SE CUI for T5 visualisation. Auto-selected if omitted.")
     p.add_argument("--n_umap_samples",    type=int,   default=2000,
-                   help="Max total samples fed to UMAP per SE.")
+                   help="Max total samples fed to UMAP per SE (keep low, UMAP is O(n²)).")
+    p.add_argument("--n_linear_samples",  type=int,   default=10000,
+                   help="Max total samples used for linear separability AUROC per SE "
+                        "(independent of --n_umap_samples; default 10000). "
+                        "Set to 0 to use all available samples.")
     p.add_argument("--umap_neighbors",    type=int,   default=30)
     p.add_argument("--umap_min_dist",     type=float, default=0.1)
     p.add_argument("--all_ses_cosine",    action="store_true",
@@ -682,12 +686,15 @@ def main():
 
     # Build pair datasets for the two SEs
     print("\n-- Building pair datasets -------------------------------------------")
+    linear_cap = args.n_linear_samples if args.n_linear_samples > 0 else None
     se_results = {}
     for se_id in (se_t1, se_t5):
         df_se = df_full[df_full["Polypharmacy Side Effect"] == se_id].copy()
         tier  = tier_map[se_id]
         n_pos = int(se_counts[se_id])
         print(f"  SE={se_id} ({tier}, n_pos={n_pos})...", end=" ", flush=True)
+
+        # UMAP dataset: capped small (UMAP is O(n²))
         X, y, ea_pos, eb_pos = build_se_pairs(
             df_se, df_full, emb, drug_to_idx,
             args.neg_ratio, args.seed, args.pair_repr,
@@ -696,20 +703,35 @@ def main():
         if X is None:
             print("SKIP (no valid pairs)")
             continue
-        print(f"{X.shape[0]:,} samples")
+        print(f"{X.shape[0]:,} samples (UMAP)")
+
+        # Linear AUROC dataset: separate, larger cap — decoupled from UMAP cap
+        if linear_cap is None or linear_cap > args.n_umap_samples:
+            X_lin, y_lin, _, _ = build_se_pairs(
+                df_se, df_full, emb, drug_to_idx,
+                args.neg_ratio, args.seed + 1, args.pair_repr,
+                max_samples=linear_cap,
+            )
+            n_lin = X_lin.shape[0] if X_lin is not None else 0
+            print(f"  {' ':>{len(se_id)+2}}{n_lin:,} samples (linear AUROC)")
+        else:
+            X_lin, y_lin = X, y
+
         se_results[se_id] = {
             "X": X, "y": y, "ea_pos": ea_pos, "eb_pos": eb_pos,
+            "X_lin": X_lin, "y_lin": y_lin,
             "tier": tier, "n_pos": n_pos,
         }
 
-    # Analysis 1: UMAP
-    # Linear separability AUROC — quantifies how well a simple linear model
-    # separates positives from negatives in the actual pair feature space
+    # Linear separability AUROC — uses the larger n_linear_samples dataset
     print("\n-- Linear separability (logistic regression 5-CV AUROC) -------------")
     for se_id, res in se_results.items():
-        lin_auroc = linear_separability_auroc(res["X"], res["y"], args.seed)
+        n_used = res["X_lin"].shape[0]
+        print(f"  {res['tier']} SE={se_id}: fitting on {n_used:,} samples...",
+              end=" ", flush=True)
+        lin_auroc = linear_separability_auroc(res["X_lin"], res["y_lin"], args.seed)
         res["lin_auroc"] = lin_auroc
-        print(f"  {res['tier']} SE={se_id}: linear AUROC = {lin_auroc:.4f}  "
+        print(f"linear AUROC = {lin_auroc:.4f}  "
               f"(0.5=random, 1.0=perfectly separable)")
 
     print("\n-- UMAP projections (features StandardScaler-normalised before UMAP) -")
