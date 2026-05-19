@@ -21,19 +21,20 @@ Pruner: MedianPruner — kills unpromising trials early after the first CV fold.
 
 Search space
 ------------
-Parameter          Type      Range / Choices
------------        ----      ---------------
-n_estimators       int       100 – 800   (step 50)
-max_depth          int       3 – 8
-learning_rate      float     0.01 – 0.3  (log scale)
-subsample          float     0.6 – 1.0
-colsample_bytree   float     0.5 – 1.0
-min_child_weight   int       1 – 10
-gamma              float     0.0 – 1.0   (was 5.0; >1 almost always harmful)
-reg_alpha          float     1e-6 – 1.0  (log scale)  L1  (was 10.0)
-reg_lambda         float     1e-6 – 1.0  (log scale)  L2  (was 10.0)
-scale_pos_weight   float     0.8 – 1.5   (was 0.5–5.0; balanced data needs ~1.0)
-neg_ratio          int       1 – 5       (negatives per positive, dataset-level)
+Parameter          Type        Range / Choices
+-----------        ----        ---------------
+n_estimators       int         100 – 800   (step 50)
+max_depth          int         3 – 9       (step 2: 3, 5, 7, 9)
+learning_rate      float       0.01 – 0.3  (log scale)
+subsample          float       0.4 – 1.0
+colsample_bytree   float       0.3 – 1.0
+min_child_weight   int         1 – 10
+gamma              float       1e-8 – 1.0  (log scale; matches official Optuna XGBoost example)
+reg_alpha          float       1e-6 – 1.0  (log scale)  L1
+reg_lambda         float       1e-6 – 1.0  (log scale)  L2
+scale_pos_weight   float       0.8 – 1.5
+grow_policy        categorical depthwise, lossguide
+neg_ratio          int         1 – 5       (negatives per positive, dataset-level)
 
 Outputs
 -------
@@ -466,7 +467,8 @@ def train_xgboost_hpo(X_tr, y_tr, X_val, params: dict, seed: int):
         reg_alpha          = params["reg_alpha"],
         reg_lambda         = params["reg_lambda"],
         scale_pos_weight   = params["scale_pos_weight"],
-        use_label_encoder  = False,
+        grow_policy        = params.get("grow_policy", "depthwise"),
+        tree_method        = "hist",
         eval_metric        = "logloss",
         random_state       = seed,
         n_jobs             = -1,
@@ -506,15 +508,19 @@ def make_objective(
         # ── Hyperparameter suggestions ────────────────────────────────────
         params = {
             "n_estimators"     : trial.suggest_int("n_estimators", 100, 800, step=50),
-            "max_depth"        : trial.suggest_int("max_depth", 3, 8),
+            "max_depth"        : trial.suggest_int("max_depth", 3, 9, step=2),
             "learning_rate"    : trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "subsample"        : trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree" : trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "subsample"        : trial.suggest_float("subsample", 0.4, 1.0),
+            "colsample_bytree" : trial.suggest_float("colsample_bytree", 0.3, 1.0),
             "min_child_weight" : trial.suggest_int("min_child_weight", 1, 10),
-            "gamma"            : trial.suggest_float("gamma", 0.0, 1.0),
+            # log scale matches official Optuna XGBoost example; gives fine resolution
+            # near 0 where gamma has the most practical effect
+            "gamma"            : trial.suggest_float("gamma", 1e-8, 1.0, log=True),
             "reg_alpha"        : trial.suggest_float("reg_alpha", 1e-6, 1.0, log=True),
             "reg_lambda"       : trial.suggest_float("reg_lambda", 1e-6, 1.0, log=True),
             "scale_pos_weight" : trial.suggest_float("scale_pos_weight", 0.8, 1.5),
+            # lossguide can outperform depthwise on high-dimensional embedding features
+            "grow_policy"      : trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"]),
         }
 
         # ── Optionally tune neg_ratio (rebuilds dataset) ──────────────────
