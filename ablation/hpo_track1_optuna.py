@@ -51,10 +51,12 @@ Usage
     --drug_emb_chemberta drug_emb_chemberta_256.pt \\
     --prot_emb_esm2      drug_via_targets_256.pt \\
     --se_id              C0015230 \\
-    --n_trials           100 \\
+    --n_trials           150 \\
     --output             ./hpo_results
 
-  # Full (already drug-level protein tensors) — tune all five conditions
+  # Recommended: tune only conditions A and D first (most important comparison),
+  # then apply best_params_*.json to ablation_track1_ml.py for all conditions.
+  # Keep --cv_folds 5 — higher values interact badly with the MedianPruner.
   python hpo_track1_optuna.py \\
     --combo              bio-decagon-combo.csv \\
     --drug_emb_chemberta drug_emb_chemberta_256.pt \\
@@ -62,8 +64,8 @@ Usage
     --prot_emb_esm2      drug_via_targets_256.pt \\
     --prot_emb_ppi       drug_via_targets_ppi_256.pt \\
     --se_id              C0015230 \\
-    --conditions         A B C D E \\
-    --n_trials           200 \\
+    --conditions         A D \\
+    --n_trials           150 \\
     --cv_folds           5 \\
     --output             ./hpo_results \\
     --seed               42
@@ -159,10 +161,12 @@ def parse_args():
                         "per condition. Default: A D (the comparison of most interest).")
 
     # HPO settings
-    p.add_argument("--n_trials",   type=int, default=100,
-                   help="Number of Optuna trials per condition (default 100).")
+    p.add_argument("--n_trials",   type=int, default=150,
+                   help="Number of Optuna trials per condition (default 150).")
     p.add_argument("--cv_folds",   type=int, default=5,
-                   help="Number of CV folds on the training split (default 5).")
+                   help="Number of CV folds on the training split (default 5). "
+                        "Values above 5 give noisier early-fold estimates and interact "
+                        "badly with the MedianPruner; prefer 5 unless you have a large budget.")
     p.add_argument("--timeout",    type=int, default=None,
                    help="Stop HPO after this many seconds (per condition), regardless of n_trials.")
     p.add_argument("--metric",     default="auroc",
@@ -660,6 +664,22 @@ def main():
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # ── Sanity-check HPO budget ───────────────────────────────────────────
+    if args.cv_folds > 5 and args.n_trials < 100:
+        print(
+            f"WARNING: --cv_folds {args.cv_folds} with --n_trials {args.n_trials} is a poor "
+            f"combination. High fold counts make each trial slower and the MedianPruner "
+            f"more aggressive (warmup_steps={max(2, args.cv_folds // 2)}), so far fewer "
+            f"trials will complete. Consider --cv_folds 5 --n_trials 150."
+        )
+    n_conditions = len(args.conditions)
+    effective_trials = args.n_trials  # per condition
+    if n_conditions > 2 and effective_trials < 100:
+        print(
+            f"WARNING: Running {n_conditions} conditions with only {effective_trials} trials each. "
+            f"Consider tuning on --conditions A D first, then applying the best params to all conditions."
+        )
+
     # ── Load combo ────────────────────────────────────────────────────────
     df_full = load_combo(args.combo, args.min_edges)
     se_counts = df_full.groupby("Polypharmacy Side Effect").size()
@@ -843,12 +863,16 @@ def main():
                 study = pickle.load(f)
             print(f"  Resumed study with {len(study.trials)} existing trials.")
         else:
+            # n_warmup_steps must scale with cv_folds: pruning on fold 1 of 10 is
+            # far too noisy (only 10 % of each trial's budget seen).  Use at least
+            # half the folds as warm-up so the intermediate score is stable.
+            warmup_steps = max(2, args.cv_folds // 2)
             study = optuna.create_study(
                 direction="maximize",
                 sampler=optuna.samplers.TPESampler(seed=args.seed),
                 pruner=optuna.pruners.MedianPruner(
-                    n_startup_trials=10,   # don't prune until 10 trials complete
-                    n_warmup_steps=1,      # don't prune on the very first fold
+                    n_startup_trials=10,          # don't prune until 10 trials complete
+                    n_warmup_steps=warmup_steps,  # scale with cv_folds (min 2)
                     interval_steps=1,
                 ),
             )
