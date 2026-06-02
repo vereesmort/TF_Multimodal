@@ -72,6 +72,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.stats import spearmanr
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import OneCycleLR
@@ -435,23 +436,52 @@ def assign_tiers(se_counts: pd.Series, n_tiers: int = 5) -> dict:
     return tier_map
 
 
-def evaluate(
+def _degree_score_corrs(degrees: np.ndarray, scores: np.ndarray) -> tuple[float, float]:
+    """Pearson and Spearman corr(deg_product, score) on test positives for one SE."""
+    if len(degrees) < 3:
+        return float("nan"), float("nan")
+    if np.std(degrees) == 0 or np.std(scores) == 0:
+        return float("nan"), float("nan")
+    pearson  = float(np.corrcoef(degrees, scores)[0, 1])
+    spearman = float(spearmanr(degrees, scores).statistic)
+    return pearson, spearman
+
+
+def _confusion_counts(
     y_true:    np.ndarray,
     y_score:   np.ndarray,
-    se_labels: np.ndarray,
-    degrees:   np.ndarray,
-    tier_map:  dict,
-    condition: str,
+    threshold: float = 0.5,
+) -> dict[str, int]:
+    """Binary confusion matrix at a fixed score threshold (default 0.5)."""
+    yt = y_true.astype(bool)
+    yp = y_score >= threshold
+    return {
+        "tp": int(( yt &  yp).sum()),
+        "fp": int((~yt &  yp).sum()),
+        "tn": int((~yt & ~yp).sum()),
+        "fn": int(( yt & ~yp).sum()),
+    }
+
+
+def evaluate(
+    y_true:      np.ndarray,
+    y_score:     np.ndarray,
+    se_labels:   np.ndarray,
+    degrees:     np.ndarray,
+    tier_map:    dict,
+    condition:   str,
+    threshold:   float = 0.5,
 ) -> pd.DataFrame:
     """
-    Per-SE AUROC, AUPRC, AP@50 and degree-score correlation.
-    Matches ablation_track1_ml.py evaluate() exactly.
+    Per-SE AUROC, AUPRC, AP@50, confusion counts (TP/FP/TN/FN), and degree-score
+    correlation (Pearson + Spearman).
+
+    Confusion counts use ``y_score >= threshold`` (default 0.5). Degree-score
+    correlation is computed on test positives within each SE only (negatives
+    have corrupted drugs, so their deg_product reflects sampling).
     """
     results    = []
     unique_ses = np.unique(se_labels)
-
-    pos_mask   = y_true == 1
-    deg_corr   = np.corrcoef(degrees[pos_mask], y_score[pos_mask])[0, 1]
 
     for se in unique_ses:
         mask = se_labels == se
@@ -466,16 +496,29 @@ def evaluate(
         top50   = np.argsort(ys)[::-1][:50]
         ap50    = yt[top50].sum() / 50.0
 
+        pos_mask = yt == 1
+        deg_pearson, deg_spearman = _degree_score_corrs(
+            degrees[mask][pos_mask], ys[pos_mask]
+        )
+        cm = _confusion_counts(yt, ys, threshold=threshold)
+
         results.append({
-            "condition":         condition,
-            "se":                se,
-            "tier":              tier_map.get(se, "unknown"),
-            "auroc":             auroc,
-            "auprc":             auprc,
-            "ap50":              ap50,
-            "n_pos":             int(yt.sum()),
-            "n_total":           int(mask.sum()),
-            "degree_score_corr": deg_corr,
+            "condition":                  condition,
+            "se":                         se,
+            "tier":                       tier_map.get(se, "unknown"),
+            "auroc":                      auroc,
+            "auprc":                      auprc,
+            "ap50":                       ap50,
+            "n_pos":                      int(yt.sum()),
+            "n_neg":                      int((yt == 0).sum()),
+            "n_total":                    int(mask.sum()),
+            "threshold":                  threshold,
+            "tp":                         cm["tp"],
+            "fp":                         cm["fp"],
+            "tn":                         cm["tn"],
+            "fn":                         cm["fn"],
+            "degree_score_corr_pearson":  deg_pearson,
+            "degree_score_corr_spearman": deg_spearman,
         })
 
     return pd.DataFrame(results)
@@ -982,7 +1025,12 @@ def main() -> None:
                 "best_val/auroc":           best_val_auroc,
                 "per_se/median_auroc":      float(results_df["auroc"].median()),
                 "per_se/median_auprc":      float(results_df["auprc"].median()),
-                "bias/degree_score_corr":   float(results_df["degree_score_corr"].iloc[0]),
+                "bias/median_degree_score_corr_pearson":  float(
+                    results_df["degree_score_corr_pearson"].median()
+                ),
+                "bias/median_degree_score_corr_spearman": float(
+                    results_df["degree_score_corr_spearman"].median()
+                ),
                 "meta/condition":           condition,
             }
             for tier, val in results_df.groupby("tier")["auprc"].median().items():
@@ -1011,11 +1059,12 @@ def main() -> None:
     summary = (
         all_df.groupby(["condition", "tier"])
         .agg(
-            median_auroc    = ("auroc",             "median"),
-            median_auprc    = ("auprc",             "median"),
-            median_ap50     = ("ap50",              "median"),
-            median_deg_corr = ("degree_score_corr", "median"),
-            n_ses           = ("se",                "count"),
+            median_auroc               = ("auroc",                      "median"),
+            median_auprc               = ("auprc",                      "median"),
+            median_ap50                = ("ap50",                       "median"),
+            median_deg_corr_pearson    = ("degree_score_corr_pearson",  "median"),
+            median_deg_corr_spearman   = ("degree_score_corr_spearman", "median"),
+            n_ses                      = ("se",                         "count"),
         )
         .reset_index()
     )
@@ -1029,9 +1078,9 @@ def main() -> None:
     ).round(4)
     print(pivot.to_string())
 
-    print("\nDegree-score correlation (bias metric — lower is better):")
+    print("\nDegree-score correlation (bias metric — lower is better, median across SEs):")
     bias = (
-        all_df.groupby("condition")["degree_score_corr"]
+        all_df.groupby("condition")[["degree_score_corr_pearson", "degree_score_corr_spearman"]]
         .median().round(4).reset_index()
     )
     print(bias.to_string(index=False))
