@@ -474,11 +474,19 @@ def evaluate(
 ) -> pd.DataFrame:
     """
     Per-SE AUROC, AUPRC, AP@50, confusion counts (TP/FP/TN/FN), and degree-score
-    correlation (Pearson + Spearman).
+    correlation (Pearson + Spearman) computed separately on positive and negative
+    test pairs.
 
-    Confusion counts use ``y_score >= threshold`` (default 0.5). Degree-score
-    correlation is computed on test positives within each SE only (negatives
-    have corrupted drugs, so their deg_product reflects sampling).
+    Positive-pair correlation (r_pos): high r_pos can reflect real biology —
+    hub drugs genuinely co-occur in more SEs, so the model may legitimately
+    score them higher.
+
+    Negative-pair correlation (r_neg): negatives are randomly corrupted pairs
+    that should carry no true biological signal.  A high r_neg therefore
+    indicates genuine degree bias — the model inflates scores for hub pairs
+    regardless of biological relevance.
+
+    Confusion counts use ``y_score >= threshold`` (default 0.5).
     """
     results    = []
     unique_ses = np.unique(se_labels)
@@ -497,28 +505,38 @@ def evaluate(
         ap50    = yt[top50].sum() / 50.0
 
         pos_mask = yt == 1
-        deg_pearson, deg_spearman = _degree_score_corrs(
+        neg_mask = yt == 0
+
+        deg_pearson_pos, deg_spearman_pos = _degree_score_corrs(
             degrees[mask][pos_mask], ys[pos_mask]
         )
+        deg_pearson_neg, deg_spearman_neg = _degree_score_corrs(
+            degrees[mask][neg_mask], ys[neg_mask]
+        )
+
         cm = _confusion_counts(yt, ys, threshold=threshold)
 
         results.append({
-            "condition":                  condition,
-            "se":                         se,
-            "tier":                       tier_map.get(se, "unknown"),
-            "auroc":                      auroc,
-            "auprc":                      auprc,
-            "ap50":                       ap50,
-            "n_pos":                      int(yt.sum()),
-            "n_neg":                      int((yt == 0).sum()),
-            "n_total":                    int(mask.sum()),
-            "threshold":                  threshold,
-            "tp":                         cm["tp"],
-            "fp":                         cm["fp"],
-            "tn":                         cm["tn"],
-            "fn":                         cm["fn"],
-            "degree_score_corr_pearson":  deg_pearson,
-            "degree_score_corr_spearman": deg_spearman,
+            "condition":                      condition,
+            "se":                             se,
+            "tier":                           tier_map.get(se, "unknown"),
+            "auroc":                          auroc,
+            "auprc":                          auprc,
+            "ap50":                           ap50,
+            "n_pos":                          int(yt.sum()),
+            "n_neg":                          int((yt == 0).sum()),
+            "n_total":                        int(mask.sum()),
+            "threshold":                      threshold,
+            "tp":                             cm["tp"],
+            "fp":                             cm["fp"],
+            "tn":                             cm["tn"],
+            "fn":                             cm["fn"],
+            # Positive-pair degree correlation (may reflect real biology)
+            "degree_score_corr_pearson":      deg_pearson_pos,
+            "degree_score_corr_spearman":     deg_spearman_pos,
+            # Negative-pair degree correlation (pure bias signal)
+            "degree_score_corr_pearson_neg":  deg_pearson_neg,
+            "degree_score_corr_spearman_neg": deg_spearman_neg,
         })
 
     return pd.DataFrame(results)
@@ -860,7 +878,9 @@ def main() -> None:
         )
 
     results_csv  = output_dir / "ablation_mlp_results_per_se.csv"
+    curves_csv   = output_dir / "ablation_mlp_training_curves.csv"
     first_write  = True
+    first_curve  = True
     wandb_step   = 0
 
     # ── Per-condition training loop ───────────────────────────────────────────
@@ -974,8 +994,10 @@ def main() -> None:
 
         # Training loop
         best_val_auroc   = -1.0
+        best_epoch       = 0
         patience_counter = 0
         ckpt_path        = ckpt_dir / f"best_{condition}.pt"
+        epoch_rows: list[dict] = []
 
         print(f"  Training (max {args.max_epochs} epochs, patience {args.patience}) ...")
         for epoch in range(args.max_epochs):
@@ -989,10 +1011,22 @@ def main() -> None:
             except ValueError:
                 val_auroc = 0.5
 
-            print(f"  Epoch {epoch+1:3d}  train_loss={train_loss:.4f}  val_auroc={val_auroc:.4f}")
+            is_best = val_auroc > best_val_auroc
+            print(f"  Epoch {epoch+1:3d}  train_loss={train_loss:.4f}  "
+                  f"val_auroc={val_auroc:.4f}{'  *' if is_best else ''}")
 
-            if val_auroc > best_val_auroc:
+            epoch_rows.append({
+                "condition":  condition,
+                "seed":       args.seed,
+                "epoch":      epoch + 1,
+                "train_loss": train_loss,
+                "val_auroc":  val_auroc,
+                "is_best":    is_best,
+            })
+
+            if is_best:
                 best_val_auroc   = val_auroc
+                best_epoch       = epoch + 1
                 patience_counter = 0
                 torch.save(model.state_dict(), ckpt_path)
             else:
@@ -1000,6 +1034,10 @@ def main() -> None:
                 if patience_counter >= args.patience:
                     print(f"  Early stopping at epoch {epoch+1} (patience={args.patience})")
                     break
+
+        # Flush per-epoch curve rows to CSV
+        curves_df  = pd.DataFrame(epoch_rows)
+        first_curve = _append_results(curves_csv, curves_df, first_curve)
 
         # Load best checkpoint and evaluate on test set
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
@@ -1015,6 +1053,8 @@ def main() -> None:
         results_df = evaluate(
             y_true_t, y_score_t, se_labels_t, degrees_t, tier_map, condition
         )
+        results_df["best_val_auroc"] = best_val_auroc
+        results_df["best_epoch"]     = best_epoch
         first_write = _append_results(results_csv, results_df, first_write)
 
         if wandb_run is not None:
@@ -1025,11 +1065,17 @@ def main() -> None:
                 "best_val/auroc":           best_val_auroc,
                 "per_se/median_auroc":      float(results_df["auroc"].median()),
                 "per_se/median_auprc":      float(results_df["auprc"].median()),
-                "bias/median_degree_score_corr_pearson":  float(
+                "bias/median_deg_corr_pearson_pos":  float(
                     results_df["degree_score_corr_pearson"].median()
                 ),
-                "bias/median_degree_score_corr_spearman": float(
+                "bias/median_deg_corr_spearman_pos": float(
                     results_df["degree_score_corr_spearman"].median()
+                ),
+                "bias/median_deg_corr_pearson_neg":  float(
+                    results_df["degree_score_corr_pearson_neg"].median()
+                ),
+                "bias/median_deg_corr_spearman_neg": float(
+                    results_df["degree_score_corr_spearman_neg"].median()
                 ),
                 "meta/condition":           condition,
             }
@@ -1059,12 +1105,16 @@ def main() -> None:
     summary = (
         all_df.groupby(["condition", "tier"])
         .agg(
-            median_auroc               = ("auroc",                      "median"),
-            median_auprc               = ("auprc",                      "median"),
-            median_ap50                = ("ap50",                       "median"),
-            median_deg_corr_pearson    = ("degree_score_corr_pearson",  "median"),
-            median_deg_corr_spearman   = ("degree_score_corr_spearman", "median"),
-            n_ses                      = ("se",                         "count"),
+            median_auroc                    = ("auroc",                          "median"),
+            median_auprc                    = ("auprc",                          "median"),
+            median_ap50                     = ("ap50",                           "median"),
+            median_deg_corr_pearson_pos     = ("degree_score_corr_pearson",      "median"),
+            median_deg_corr_spearman_pos    = ("degree_score_corr_spearman",     "median"),
+            median_deg_corr_pearson_neg     = ("degree_score_corr_pearson_neg",  "median"),
+            median_deg_corr_spearman_neg    = ("degree_score_corr_spearman_neg", "median"),
+            mean_best_val_auroc             = ("best_val_auroc",                 "mean"),
+            mean_best_epoch                 = ("best_epoch",                     "mean"),
+            n_ses                           = ("se",                             "count"),
         )
         .reset_index()
     )
@@ -1078,9 +1128,14 @@ def main() -> None:
     ).round(4)
     print(pivot.to_string())
 
-    print("\nDegree-score correlation (bias metric — lower is better, median across SEs):")
+    print("\nDegree-score correlation — median across SEs (pos = positive pairs, neg = negative pairs):")
     bias = (
-        all_df.groupby("condition")[["degree_score_corr_pearson", "degree_score_corr_spearman"]]
+        all_df.groupby("condition")[[
+            "degree_score_corr_pearson",
+            "degree_score_corr_spearman",
+            "degree_score_corr_pearson_neg",
+            "degree_score_corr_spearman_neg",
+        ]]
         .median().round(4).reset_index()
     )
     print(bias.to_string(index=False))
